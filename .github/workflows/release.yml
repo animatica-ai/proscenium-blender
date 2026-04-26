@@ -1,0 +1,51 @@
+# Build the installable Blender addon zip on every `vX.Y.Z` tag and
+# attach it to a GitHub Release.
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write   # required to create the release
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Verify tag matches bl_info version
+        run: |
+          TAG="${GITHUB_REF#refs/tags/v}"
+          PKG=$(make -s info | awk '/^version:/ { print $2 }')
+          echo "tag=$TAG  bl_info=$PKG"
+          test "$TAG" = "$PKG"
+
+      - name: Build addon zip
+        run: make zip
+
+      - name: List built artifacts
+        run: ls -la dist/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*.zip
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            **Install in Blender 4.x:**
+
+            1. Download `proscenium-blender-${{ github.ref_name }}.zip` below
+            2. Edit → Preferences → Add-ons → Install…
+            3. Pick the downloaded zip
+            4. Tick **Proscenium — AI Motion Generation**
+
+            See the [README](https://github.com/animatica-ai/proscenium-blender#readme)
+            for configuration (server URL) and usage.
