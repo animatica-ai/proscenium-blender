@@ -33,9 +33,10 @@ from __future__ import annotations
 from typing import Any
 
 import bpy
+from bpy.props import BoolProperty
 from mathutils import Vector
 
-from . import coords, mmcp_client
+from . import body_mesh, coords, mmcp_client
 
 
 LEAF_TAIL_LENGTH = 0.05   # metres, +Y in MMCP frame (= +Z in Blender)
@@ -54,6 +55,17 @@ class PROSCENIUM_OT_import_canonical_skeleton(bpy.types.Operator):
         "generation — its joint names match the server's expectations exactly"
     )
     bl_options = {'REGISTER', 'UNDO'}
+
+    with_body: BoolProperty(
+        name="Include body mesh",
+        description=(
+            "Also import the SOMA77 reference body mesh, skinned to the "
+            "imported armature. Weights for joints not present on the "
+            "armature (fingers, jaw) get redistributed to their nearest "
+            "ancestor — fingers don't curl, but the body shape is preserved"
+        ),
+        default=True,
+    )
 
     def execute(self, context):
         settings = context.scene.proscenium
@@ -75,7 +87,7 @@ class PROSCENIUM_OT_import_canonical_skeleton(bpy.types.Operator):
             return {'CANCELLED'}
 
         try:
-            arm_obj = build_armature_from_canonical(model_id, joints, context)
+            arm_obj, floor_lift = build_armature_from_canonical(model_id, joints, context)
         except ValueError as exc:
             self.report({'ERROR'}, str(exc))
             return {'CANCELLED'}
@@ -83,7 +95,27 @@ class PROSCENIUM_OT_import_canonical_skeleton(bpy.types.Operator):
         # Wire it as the generation target.
         settings.target_armature = arm_obj
 
-        self.report({'INFO'}, f"Imported {model_id} ({len(joints)} joints)")
+        body_loaded = False
+        if (
+            self.with_body
+            and body_mesh.asset_available()
+            and body_mesh.looks_like_kimodo_skeleton(arm_obj)
+        ):
+            try:
+                body_obj = body_mesh.load_body_mesh(
+                    arm_obj, context,
+                    canonical_joints=joints,
+                    floor_lift=floor_lift,
+                )
+                body_loaded = body_obj is not None
+            except Exception as exc:                                 # noqa: BLE001
+                # Mesh is a nice-to-have; never fail the armature import on it.
+                self.report({'WARNING'}, f"Imported armature but body mesh failed: {exc}")
+
+        msg = f"Imported {model_id} ({len(joints)} joints)"
+        if body_loaded:
+            msg += " with body mesh"
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
 
 
@@ -95,12 +127,16 @@ def build_armature_from_canonical(
     model_id: str,
     joints: list[dict[str, Any]],
     context,
-) -> bpy.types.Object:
+) -> tuple[bpy.types.Object, float]:
     """Create + link a Blender Armature object whose bones mirror ``joints``.
 
-    Returns the new armature *object* (not the data block). Always creates
-    a new object — re-importing the same model produces ``model_id.001``,
-    ``.002``, etc.
+    Returns ``(armature_object, floor_lift)``. The lift is the +Z offset
+    applied to every bone head/tail so the lowest joint sits on Blender's
+    z=0 plane; downstream code that wants to align other geometry with the
+    rest pose (e.g. the body mesh) needs the same value.
+
+    Always creates a new object — re-importing the same model produces
+    ``model_id.001``, ``.002``, etc.
     """
     name_to_local: dict[str, tuple[float, float, float]] = {}
     name_to_parent: dict[str, str | None] = {}
@@ -200,4 +236,4 @@ def build_armature_from_canonical(
     # the rig matches the server's canonical skeleton without name-matching.
     arm_obj["proscenium_canonical_model"] = model_id
 
-    return arm_obj
+    return arm_obj, floor_lift

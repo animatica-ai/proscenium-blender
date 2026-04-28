@@ -133,6 +133,8 @@ class PROSCENIUM_OT_generate(Operator):
         if settings.source_action_name:
             src = bpy.data.actions.get(settings.source_action_name)
             if src is not None:
+                if arm.animation_data is None:
+                    arm.animation_data_create()
                 arm.animation_data.action = src
 
         try:
@@ -325,6 +327,8 @@ class PROSCENIUM_OT_reject(Operator):
             self.report({'WARNING'}, f"Source action {s.source_action_name!r} not found")
             return {'CANCELLED'}
 
+        if arm.animation_data is None:
+            arm.animation_data_create()
         arm.animation_data.action = source
 
         # Drop any orphaned generated actions so they don't pile up.
