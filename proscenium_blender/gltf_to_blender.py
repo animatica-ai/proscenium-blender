@@ -252,6 +252,261 @@ def bake_gltf_to_armature(
     return new_action
 
 
+def bake_gltf_to_actions_per_block(
+    gltf: dict[str, Any],
+    armature_obj: bpy.types.Object,
+    *,
+    blocks: list[tuple[int, int, str]],
+    request_start_frame: int,
+    sample_index: int = 0,
+    anchor_frames: set[int] | None = None,
+) -> list[bpy.types.Action]:
+    """Slice one full-timeline gltf response into N per-block actions.
+
+    The single request is unchanged — the model still sees every prompt
+    segment at once, so its internal transition handling is preserved. We
+    just route the resulting fcurve keyframes into N separate actions, one
+    per ``blocks`` entry (typically one per enabled prompt block, with each
+    block claiming half the gap on either side so strips abut on the NLA).
+
+    ``blocks`` is ``[(frame_start, frame_end, action_name), ...]`` in the
+    armature's scene frame space. ``request_start_frame`` is the scene
+    frame the request's gltf time=0 maps to (i.e. the global ``gen_start``
+    from ``compute_frame_range``); needed to convert gltf timestamps back
+    to scene frames consistently across blocks.
+
+    Returns the new actions in input order. The armature's active action is
+    cleared so the caller can NLA-push the strips and let the timeline
+    drive playback. Joints that don't exist on the rig are silently
+    skipped (recorded on the first action's ``proscenium_skipped_joints``
+    custom prop for the operator to surface).
+
+    Control-rig handling is intentionally NOT applied here — this slice
+    path targets straight skeletons. Callers should detect a control rig
+    and fall back to ``bake_gltf_to_armature`` (single action + Mixamo
+    operator hand-off).
+    """
+    if armature_obj is None or armature_obj.type != 'ARMATURE':
+        raise ValueError("bake target must be an ARMATURE object")
+    if not blocks:
+        return []
+
+    animations = gltf.get("animations") or []
+    if not animations:
+        raise ValueError("response has no animations[]")
+    if sample_index < 0 or sample_index >= len(animations):
+        raise ValueError(f"sample_index {sample_index} out of range (0..{len(animations) - 1})")
+
+    nodes    = gltf.get("nodes") or []
+    anim     = animations[sample_index]
+    samplers = anim.get("samplers") or []
+    channels = anim.get("channels") or []
+
+    # Same dedup-on-output decoding as the single-action path.
+    decoded_outputs: dict[int, list[tuple]] = {}
+    decoded_inputs:  dict[int, list[float]] = {}
+
+    def _input_for(idx: int) -> list[float]:
+        s = samplers[idx]
+        ii = s["input"]
+        if ii not in decoded_inputs:
+            decoded_inputs[ii] = _read_floats(gltf, ii, "SCALAR")
+        return decoded_inputs[ii]
+
+    def _quats_for(idx: int) -> list[tuple[float, float, float, float]]:
+        s = samplers[idx]
+        oi = s["output"]
+        if oi not in decoded_outputs:
+            f = _read_floats(gltf, oi, "VEC4")
+            decoded_outputs[oi] = [
+                (f[i], f[i + 1], f[i + 2], f[i + 3])
+                for i in range(0, len(f), 4)
+            ]
+        return decoded_outputs[oi]
+
+    def _vec3s_for(idx: int) -> list[tuple[float, float, float]]:
+        s = samplers[idx]
+        oi = s["output"]
+        if oi not in decoded_outputs:
+            f = _read_floats(gltf, oi, "VEC3")
+            decoded_outputs[oi] = [
+                (f[i], f[i + 1], f[i + 2])
+                for i in range(0, len(f), 3)
+            ]
+        return decoded_outputs[oi]
+
+    pose = armature_obj.pose
+    for pb in pose.bones:
+        pb.rotation_mode = 'QUATERNION'
+
+    if armature_obj.animation_data is None:
+        armature_obj.animation_data_create()
+
+    mw_rot   = armature_obj.matrix_world.to_quaternion().to_matrix()
+    mw_rot_t = mw_rot.transposed()
+    arm_world_inv = armature_obj.matrix_world.inverted()
+
+    skipped: list[str] = []
+    actions: list[bpy.types.Action] = []
+
+    for fs, fe, action_name in blocks:
+        action = bpy.data.actions.new(name=action_name)
+
+        # Build the layered-Action structure manually instead of relying on
+        # ``bone.keyframe_insert`` (which writes through the armature's
+        # active action). Switching ``animation_data.action`` between the N
+        # blocks during a single bake leaves Blender 5.x's NLA evaluator in
+        # a stale state where strips referencing the just-touched actions
+        # silently produce zero contribution. Writing directly to the
+        # action's channelbag fcurves bypasses ``animation_data.action``
+        # entirely, so each new action is born clean and its NLA strip
+        # evaluates the moment we push it.
+        layer = action.layers.new(name="Layer")
+        strip = layer.strips.new(type='KEYFRAME')
+        slot = action.slots.new(id_type='OBJECT', name=armature_obj.name)
+        cb = strip.channelbag(slot, ensure=True)
+
+        fcache: dict[tuple[str, int], bpy.types.FCurve] = {}
+
+        def _fc(data_path: str, index: int) -> bpy.types.FCurve:
+            key = (data_path, index)
+            fc = fcache.get(key)
+            if fc is None:
+                fc = cb.fcurves.new(data_path=data_path, index=index)
+                fcache[key] = fc
+            return fc
+
+        def _write_kps(fc: bpy.types.FCurve, frames: list[int], values: list[float]) -> None:
+            """Bulk-add keyframes via ``foreach_set("co", ...)``."""
+            if not frames:
+                return
+            n = len(frames)
+            base = len(fc.keyframe_points)
+            fc.keyframe_points.add(n)
+            flat = [0.0] * (2 * n)
+            for i, (f, v) in enumerate(zip(frames, values)):
+                flat[2 * i] = float(f)
+                flat[2 * i + 1] = float(v)
+            # foreach_set walks the entire collection, so write into a fresh
+            # buffer that mirrors the existing keyframes plus the new ones.
+            full = [0.0] * (2 * (base + n))
+            for i, kp in enumerate(fc.keyframe_points[:base]):
+                full[2 * i]     = kp.co[0]
+                full[2 * i + 1] = kp.co[1]
+            for i, (f, v) in enumerate(zip(frames, values)):
+                full[2 * (base + i)]     = float(f)
+                full[2 * (base + i) + 1] = float(v)
+            fc.keyframe_points.foreach_set("co", full)
+            fc.update()
+
+        # Rotation channels (one per non-root bone, plus root).
+        for ch in channels:
+            target = ch.get("target") or {}
+            if target.get("path") != ROTATION_PATH:
+                continue
+            node_idx = target.get("node")
+            if node_idx is None or node_idx >= len(nodes):
+                continue
+            joint_name = nodes[node_idx].get("name", "")
+            bone = pose.bones.get(joint_name)
+            if bone is None:
+                skipped.append(joint_name)
+                continue
+
+            timestamps = _input_for(ch["sampler"])
+            quats      = _quats_for(ch["sampler"])
+
+            ML     = bone.bone.matrix_local.to_3x3()
+            ML_inv = ML.transposed()
+
+            data_path = f'pose.bones["{joint_name}"].rotation_quaternion'
+            buf_w: list[float] = []
+            buf_x: list[float] = []
+            buf_y: list[float] = []
+            buf_z: list[float] = []
+            buf_f: list[int]   = []
+
+            for ts, q_mmcp in zip(timestamps, quats):
+                frame = _frame_from_time(ts, gltf, request_start_frame)
+                if not (fs <= frame <= fe):
+                    continue
+                qx, qy, qz, qw = q_mmcp
+                R_mmcp          = Quaternion((qw, qx, qy, qz)).to_matrix()
+                R_blender_world = _MMCP_TO_BLENDER @ R_mmcp @ _MMCP_TO_BLENDER.transposed()
+                R_blender_arm   = mw_rot_t @ R_blender_world @ mw_rot
+                R_bone          = ML_inv @ R_blender_arm @ ML
+                qb              = R_bone.to_quaternion()
+                buf_f.append(frame)
+                buf_w.append(qb.w)
+                buf_x.append(qb.x)
+                buf_y.append(qb.y)
+                buf_z.append(qb.z)
+
+            _write_kps(_fc(data_path, 0), buf_f, buf_w)
+            _write_kps(_fc(data_path, 1), buf_f, buf_x)
+            _write_kps(_fc(data_path, 2), buf_f, buf_y)
+            _write_kps(_fc(data_path, 3), buf_f, buf_z)
+
+        # Translation channels (root bone only in practice).
+        for ch in channels:
+            target = ch.get("target") or {}
+            if target.get("path") != TRANSLATION_PATH:
+                continue
+            node_idx = target.get("node")
+            if node_idx is None or node_idx >= len(nodes):
+                continue
+            joint_name = nodes[node_idx].get("name", "")
+            bone = pose.bones.get(joint_name)
+            if bone is None:
+                skipped.append(joint_name)
+                continue
+
+            timestamps = _input_for(ch["sampler"])
+            positions  = _vec3s_for(ch["sampler"])
+
+            rest_head = bone.bone.head_local
+            ML        = bone.bone.matrix_local.to_3x3()
+            ML_T      = ML.transposed()
+
+            data_path = f'pose.bones["{joint_name}"].location'
+            buf_x: list[float] = []
+            buf_y: list[float] = []
+            buf_z: list[float] = []
+            buf_f: list[int]   = []
+
+            for ts, p_mmcp in zip(timestamps, positions):
+                frame = _frame_from_time(ts, gltf, request_start_frame)
+                if not (fs <= frame <= fe):
+                    continue
+                world     = Vector(coords.mmcp_pos_to_blender(p_mmcp))
+                arm_local = arm_world_inv @ world
+                delta     = arm_local - rest_head
+                local_t   = ML_T @ delta
+                buf_f.append(frame)
+                buf_x.append(local_t.x)
+                buf_y.append(local_t.y)
+                buf_z.append(local_t.z)
+
+            _write_kps(_fc(data_path, 0), buf_f, buf_x)
+            _write_kps(_fc(data_path, 1), buf_f, buf_y)
+            _write_kps(_fc(data_path, 2), buf_f, buf_z)
+
+        if anchor_frames is not None:
+            block_anchors = {f for f in anchor_frames if fs <= f <= fe}
+            _tag_keyframe_types(action, block_anchors)
+
+        actions.append(action)
+
+    if skipped and actions:
+        actions[0]["proscenium_skipped_joints"] = sorted(set(skipped))
+
+    # We never touched ``animation_data.action`` (we wrote fcurves directly
+    # via the layered-Action API), so there's nothing to clear here. The
+    # caller is responsible for NLA pushing and active-action management.
+
+    return actions
+
+
 _BONE_FOLLOWING_CONSTRAINTS = frozenset({
     "COPY_TRANSFORMS",
     "COPY_ROTATION",

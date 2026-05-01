@@ -39,32 +39,200 @@ POSE_ACTION_NAME     = "Proscenium_Pose"
 GENERATED_ACTION_NAME = MOTION_ACTION_PREFIX
 
 
-def _build_motion_action_name(prompt_blocks) -> str:
-    """Descriptive Blender action name for a motion bake.
+_NLA_TRACK_PREFIX = "Proscenium: "
 
-    Picks the first enabled prompt block's text as the descriptive suffix,
-    truncated so the full name stays under Blender's 64-char action-name
-    limit. Falls back to ``MOTION_ACTION_PREFIX`` alone when no prompt is
-    available (constraint-only generations). Subsequent regenerations get
-    Blender's automatic ``.001`` / ``.002`` suffixes for free.
+
+def _action_name_for_prompt(prompt: str) -> str:
+    """Build an action name from a single block's prompt, clamped to fit
+    Blender's 63-char action-name limit (with room left for ``.001`` auto
+    suffixing).
     """
-    label = ""
+    label = (prompt or "").strip()
+    name = f"{MOTION_ACTION_PREFIX}: {label}" if label else MOTION_ACTION_PREFIX
+    MAX = 56
+    if len(name) > MAX:
+        name = name[:MAX - 1] + "…"
+    return name
+
+
+def _build_motion_action_name(prompt_blocks) -> str:
+    """Descriptive Blender action name for a single-action motion bake.
+
+    Picks the first enabled prompt block's text as the descriptive suffix.
+    Used for the single-block / single-action fallback path; multi-block
+    bakes call ``_action_name_for_prompt`` per block instead.
+    """
     for b in prompt_blocks or ():
         if not getattr(b, "enabled", True):
             continue
         text = (b.prompt or "").strip()
         if text:
-            label = text
-            break
-    if not label:
-        return MOTION_ACTION_PREFIX
-    name = f"{MOTION_ACTION_PREFIX}: {label}"
-    # Blender allows up to 63 chars; clamp with an ellipsis a few chars under
-    # so the auto-suffixer has room for ``.001``-style tags.
-    MAX = 56
-    if len(name) > MAX:
-        name = name[:MAX - 1] + "…"
-    return name
+            return _action_name_for_prompt(text)
+    return MOTION_ACTION_PREFIX
+
+
+def _block_ranges_for_split(prompt_blocks, gen_start: int, gen_end: int):
+    """Compute per-block ``(frame_start, frame_end, action_name)`` triples
+    with half-gap expansion so NLA strips abut perfectly.
+
+    Each enabled block claims half of the gap on each side (the rest going
+    to its neighbor). The first block expands left to ``gen_start``, the
+    last expands right to ``gen_end``, so no model output is discarded and
+    no scene frame is uncovered.
+
+    Returns ``[]`` if fewer than 2 enabled blocks are present (caller falls
+    back to single-action bake in that case).
+    """
+    enabled = sorted(
+        (b for b in prompt_blocks or () if getattr(b, "enabled", True)),
+        key=lambda b: int(b.frame_start),
+    )
+    if len(enabled) < 2:
+        return []
+
+    ranges: list[tuple[int, int, str]] = []
+    for i, b in enumerate(enabled):
+        fs = int(b.frame_start)
+        fe = int(b.frame_end)
+        if i == 0:
+            fs = min(fs, gen_start)
+        else:
+            prev_fe = int(enabled[i - 1].frame_end)
+            # Midpoint between this block's start and previous block's end —
+            # the +1 keeps strips non-overlapping when a gap has odd length.
+            fs = (prev_fe + fs) // 2 + 1
+        if i == len(enabled) - 1:
+            fe = max(fe, gen_end)
+        else:
+            next_fs = int(enabled[i + 1].frame_start)
+            fe = (fe + next_fs) // 2
+
+        ranges.append((fs, fe, _action_name_for_prompt(b.prompt)))
+    return ranges
+
+
+def _push_actions_to_nla(armature_obj, actions) -> None:
+    """Place every per-block action on a SINGLE shared NLA track named
+    ``Proscenium: Motion``, in start-frame order.
+
+    Strips share one track (instead of one track per strip) so playback is
+    sequential: one block ends, the next plays. Putting each strip on its
+    own track would stack them layered and play them simultaneously, which
+    is the wrong default for a "play the timeline back end-to-end" workflow.
+    Half-gap expansion in ``_block_ranges_for_split`` guarantees the strips
+    don't overlap on the shared track.
+
+    Wipes any prior ``Proscenium: ``-prefixed tracks first so a regenerate
+    doesn't pile up duplicates.
+    """
+    if armature_obj.animation_data is None:
+        armature_obj.animation_data_create()
+    nla = armature_obj.animation_data.nla_tracks
+
+    for track in list(nla):
+        if track.name.startswith(_NLA_TRACK_PREFIX):
+            nla.remove(track)
+
+    if not actions:
+        return
+
+    track = nla.new()
+    track.name = f"{_NLA_TRACK_PREFIX}Motion"
+
+    # Sort by action.frame_range[0] so strips are added in timeline order;
+    # NLA refuses out-of-order or overlapping strip insertions on the same
+    # track, and an in-order pass is the safest contract.
+    def _sort_key(a):
+        try:
+            return float(a.frame_range[0])
+        except Exception:
+            return 0.0
+
+    for action in sorted(actions, key=_sort_key):
+        try:
+            start = int(action.frame_range[0])
+        except Exception:
+            start = 1
+        strip = track.strips.new(name=action.name, start=start, action=action)
+        # Blender 5.x ``strips.new`` returns a strip with ``influence=0`` by
+        # default in some configurations — that's "the strip exists but
+        # contributes nothing to the pose", which silently kills playback.
+        # Force full influence so the strip drives the pose at 100%.
+        strip.influence = 1.0
+        # Disable blend-in/out ramps too — half-gap expansion already
+        # places strips so they abut, no soft fade needed.
+        strip.blend_in = 0.0
+        strip.blend_out = 0.0
+
+
+def _clear_proscenium_nla_tracks(armature_obj) -> None:
+    """Remove every NLA track the addon owns. Called from Reject."""
+    if armature_obj is None or armature_obj.animation_data is None:
+        return
+    nla = armature_obj.animation_data.nla_tracks
+    for track in list(nla):
+        if track.name.startswith(_NLA_TRACK_PREFIX):
+            nla.remove(track)
+
+
+def _split_action_into_blocks(
+    source_action,
+    armature_obj,
+    blocks,
+):
+    """Slice ``source_action``'s keyframes into N per-block actions.
+
+    For each ``(frame_start, frame_end, action_name)`` in ``blocks``, builds
+    a fresh action via the layered-Action API (mirrors the structure of the
+    multi-block bake helper) and copies in only the source's keyframes that
+    fall within ``[frame_start, frame_end]``. Keyframe ``type`` is preserved
+    so previously-tagged ``KEYFRAME`` anchors keep their dopesheet styling
+    after the split.
+
+    Layered-API construction (instead of ``source_action.copy()`` + trim) is
+    deliberate: it sidesteps the NLA-state corruption Blender 5.x exhibits
+    when an action is touched-then-detached during keyframe writes. Fresh
+    actions always evaluate cleanly on NLA strips.
+
+    Returns the list of new actions in input order.
+    """
+    new_actions = []
+
+    for fs, fe, action_name in blocks:
+        new_a = bpy.data.actions.new(name=action_name)
+        layer = new_a.layers.new(name="Layer")
+        strip = layer.strips.new(type='KEYFRAME')
+        slot = new_a.slots.new(id_type='OBJECT', name=armature_obj.name)
+        cb = strip.channelbag(slot, ensure=True)
+
+        for src_fc in constraints_ui.iter_action_fcurves(source_action):
+            in_range = [
+                (kp.co[0], kp.co[1], kp.type)
+                for kp in src_fc.keyframe_points
+                if fs <= kp.co[0] <= fe
+            ]
+            if not in_range:
+                continue
+
+            new_fc = cb.fcurves.new(
+                data_path=src_fc.data_path,
+                index=src_fc.array_index,
+            )
+            n = len(in_range)
+            new_fc.keyframe_points.add(n)
+            flat = [0.0] * (2 * n)
+            for i, (f, v, _t) in enumerate(in_range):
+                flat[2 * i]     = float(f)
+                flat[2 * i + 1] = float(v)
+            new_fc.keyframe_points.foreach_set("co", flat)
+            for kp_obj, (_, _, kp_type) in zip(new_fc.keyframe_points[:n], in_range):
+                kp_obj.type = kp_type
+            new_fc.update()
+
+        new_a.use_fake_user = True
+        new_actions.append(new_a)
+
+    return new_actions
 
 
 def _stash_quota_state(settings, exc) -> None:
@@ -294,18 +462,70 @@ class PROSCENIUM_OT_generate(Operator):
         # Successful run — clear any stale quota banner.
         _clear_quota_state(context.scene.proscenium)
 
-        # Bake.
+        # Bake. Two paths:
+        #   • 2+ enabled prompt blocks → split the response into one action
+        #     per block, push to NLA. Lets the user iterate on individual
+        #     blocks later (and matches Blender's "strip per beat" mental
+        #     model). Control-rig handling is intentionally bypassed here;
+        #     fall back to the single-action path for control rigs.
+        #   • Otherwise → existing single-action bake (handles control rigs
+        #     via the Mixamo operator hand-off).
+        gen_start = getattr(self, "_gen_start_frame", context.scene.frame_start)
+        gen_end_settings_scene_frame = context.scene.frame_end
+        # Recompute gen_end via the same helper to stay in sync with what
+        # was sent to the server.
+        _, gen_end = request_builder.compute_frame_range(
+            settings.prompt_blocks, settings.target_armature, context.scene
+        )
+
+        block_ranges = (
+            _block_ranges_for_split(settings.prompt_blocks, gen_start, gen_end)
+            if not request_builder.is_control_rig(settings.target_armature)
+            else []
+        )
+
+        n_actions = 0
+        skipped: list[str] = []
         try:
+            # Always bake as a single action for preview — it scrubs cleanly
+            # via the active-action / dopesheet display, no NLA stack
+            # required. Multi-block scenes still get split into per-block
+            # actions on Accept; we just stash the block ranges on the
+            # armature so the Accept handler knows what to do.
+            preview_name = (
+                f"{MOTION_ACTION_PREFIX}: Preview"
+                if block_ranges
+                else _build_motion_action_name(settings.prompt_blocks)
+            )
             action = gltf_to_blender.bake_gltf_to_armature(
                 self._result,
                 settings.target_armature,
                 sample_index=0,
-                action_name=_build_motion_action_name(settings.prompt_blocks),
-                start_frame=getattr(
-                    self, "_gen_start_frame", context.scene.frame_start
-                ),
+                action_name=preview_name,
+                start_frame=gen_start,
                 anchor_frames=getattr(self, "_anchor_frames", None),
             )
+            n_actions = 1
+            skipped = list(action.get("proscenium_skipped_joints") or [])
+
+            arm = settings.target_armature
+            if block_ranges:
+                # Stash split metadata for Accept. Blender's ID-property
+                # arrays are homogeneous numerics-only ("only floats, ints,
+                # booleans and dicts are allowed in ID property arrays"),
+                # which rules out a list-of-(int, int, str) shape. JSON-
+                # encode into a string custom prop instead — survives save/
+                # reload, decodes cheaply on Accept.
+                import json as _json
+                arm["proscenium_pending_block_ranges"] = _json.dumps([
+                    [int(fs), int(fe), str(name)] for fs, fe, name in block_ranges
+                ])
+            else:
+                # Single-block / control-rig path: drop any stale stash
+                # from a prior multi-block preview that the user is
+                # overwriting in place.
+                if "proscenium_pending_block_ranges" in arm:
+                    del arm["proscenium_pending_block_ranges"]
         except Exception as exc:                         # noqa: BLE001 — surfaced to UI
             self._cleanup(context)
             self.report({'ERROR'}, f"Bake failed: {exc}")
@@ -314,11 +534,14 @@ class PROSCENIUM_OT_generate(Operator):
         # Bake succeeded — keep the source-action reference so the
         # Accept / Reject preview UI knows what to fall back to.
         self._cleanup(context, preview=True)
-        skipped = action.get("proscenium_skipped_joints") or []
+        msg_suffix = f" ({n_actions} actions)" if n_actions > 1 else ""
         if skipped:
-            self.report({'WARNING'}, f"Done — skipped {len(skipped)} unmatched joint(s)")
+            self.report(
+                {'WARNING'},
+                f"Done — skipped {len(skipped)} unmatched joint(s){msg_suffix}",
+            )
         else:
-            self.report({'INFO'}, "Generation complete")
+            self.report({'INFO'}, f"Generation complete{msg_suffix}")
         return {'FINISHED'}
 
     def _cleanup(self, context, *, preview: bool = False) -> None:
@@ -367,15 +590,79 @@ class PROSCENIUM_OT_cancel_generation(Operator):
 
 class PROSCENIUM_OT_accept(Operator):
     bl_idname = "proscenium.accept"
-    bl_label = "Accept"
+    bl_label = "Push to NLA"
     bl_description = (
-        "Keep the generated motion. The generated Proscenium action stays "
-        "as the armature's active action; the source action reference is released"
+        "Commit the generated motion to the NLA stack. The preview action "
+        "(single-block) or its per-block split (multi-block) is placed on a "
+        "single shared NLA track named 'Proscenium: Motion'. The active "
+        "action is cleared so NLA drives playback, and the source-action "
+        "reference is released"
     )
 
     def execute(self, context):
-        context.scene.proscenium.source_action_name = ""
-        self.report({'INFO'}, "Generated motion accepted")
+        s = context.scene.proscenium
+        arm = s.target_armature
+        n_pushed = 0
+
+        if arm is not None and arm.type == 'ARMATURE':
+            import json as _json
+            pending_raw = arm.get("proscenium_pending_block_ranges")
+            try:
+                pending = _json.loads(pending_raw) if pending_raw else []
+            except (TypeError, ValueError):
+                pending = []
+            block_ranges = [
+                (int(r[0]), int(r[1]), str(r[2]))
+                for r in pending
+                if len(r) >= 3
+            ]
+
+            preview_action = (
+                arm.animation_data.action
+                if arm.animation_data and arm.animation_data.action
+                else None
+            )
+
+            actions_to_push: list = []
+
+            if len(block_ranges) >= 2 and preview_action is not None:
+                # Multi-block: build the per-block actions from the preview's
+                # fcurves, drop the preview, push the splits.
+                actions_to_push = _split_action_into_blocks(
+                    preview_action, arm, block_ranges,
+                )
+                arm.animation_data.action = None
+                bpy.data.actions.remove(preview_action)
+            elif (
+                preview_action is not None
+                and preview_action.name.startswith(
+                    request_builder._GENERATED_ACTION_PREFIXES
+                )
+            ):
+                # Single-block: push the preview as-is (it's already the
+                # final, prompt-named motion action). Detach from the
+                # armature so NLA evaluation isn't shadowed by an active
+                # action of the same content.
+                preview_action.use_fake_user = True
+                actions_to_push = [preview_action]
+                arm.animation_data.action = None
+
+            if actions_to_push:
+                _push_actions_to_nla(arm, actions_to_push)
+                n_pushed = len(actions_to_push)
+
+            if "proscenium_pending_block_ranges" in arm:
+                del arm["proscenium_pending_block_ranges"]
+
+        s.source_action_name = ""
+        if n_pushed:
+            label = "strip" if n_pushed == 1 else "strips"
+            self.report(
+                {'INFO'},
+                f"Pushed {n_pushed} {label} to NLA track 'Proscenium: Motion'",
+            )
+        else:
+            self.report({'INFO'}, "Generated motion pushed to NLA")
         return {'FINISHED'}
 
 
@@ -401,15 +688,32 @@ class PROSCENIUM_OT_reject(Operator):
 
         if arm.animation_data is None:
             arm.animation_data_create()
+
+        # Defensive: if the user manually assembled the per-block actions
+        # onto NLA, strip our tracks before restoring the source action so
+        # they don't keep playing on top.
+        _clear_proscenium_nla_tracks(arm)
+
+        # Drop the pending-block-ranges stash — the preview action it
+        # described is about to be orphaned and removed below.
+        if "proscenium_pending_block_ranges" in arm:
+            del arm["proscenium_pending_block_ranges"]
+
         arm.animation_data.action = source
 
-        # Drop any orphaned motion-bake outputs so they don't pile up.
-        # Match on the motion-only prefix tuple — pose-generator actions
+        # Drop motion-bake orphans. Multi-block bakes mark each per-block
+        # action with ``use_fake_user`` so Blender doesn't purge them while
+        # the user is iterating; we have to look past that fake user when
+        # deciding what's truly orphaned. Pose-generator actions
         # (``Proscenium_Pose`` / legacy ``Proscenium_Poses``) are user-
-        # authored anchors and stay even when not currently assigned.
+        # authored anchors and stay regardless of whether they're assigned.
+        def _is_orphan(a):
+            real_users = a.users - (1 if a.use_fake_user else 0)
+            return real_users <= 0
+
         for ac in [a for a in bpy.data.actions
                    if a.name.startswith(request_builder._GENERATED_ACTION_PREFIXES)
-                   and a.users == 0]:
+                   and _is_orphan(a)]:
             bpy.data.actions.remove(ac)
 
         s.source_action_name = ""
