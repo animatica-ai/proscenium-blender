@@ -13,7 +13,7 @@ optimisation runs on the backend server.
 bl_info = {
     "name": "Proscenium — AI Motion Generation",
     "author": "Animatica",
-    "version": (0, 2, 0),
+    "version": (0, 3, 0),
     "blender": (4, 0, 0),
     "location": "View3D > Sidebar > Proscenium",
     "description": "AI motion generation — select armature, set keyframes, generate",
