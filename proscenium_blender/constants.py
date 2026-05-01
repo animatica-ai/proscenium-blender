@@ -15,14 +15,17 @@ ROOT_PATH_CONTROL_POINTS = 4
 # Empty display sizes (metres) for effector-target empties.
 EFFECTOR_EMPTY_SIZE = 0.08
 
+# Canonical end-effector joints the user can pin. Restricted to the four
+# limb tips — pinning interior chain joints (spine, neck, shoulders) tends
+# to over-constrain the IK solver and produce broken motion.
+END_EFFECTOR_JOINTS = ("LeftHand", "RightHand", "LeftFoot", "RightFoot")
+
 # Per-joint colours for effector empties — pure aesthetics, no semantics.
 EFFECTOR_COLORS = {
-    "Hips":      (1.0, 0.63, 0.34, 1.0),
     "LeftFoot":  (0.30, 0.70, 1.00, 1.0),
     "RightFoot": (0.30, 0.70, 1.00, 1.0),
     "LeftHand":  (0.30, 1.00, 0.50, 1.0),
     "RightHand": (0.30, 1.00, 0.50, 1.0),
-    "Head":      (1.00, 0.85, 0.30, 1.0),
 }
 
 # Custom-property keys stamped on Blender objects to mark them as MMCP

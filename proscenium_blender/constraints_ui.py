@@ -240,6 +240,10 @@ def _root_keyframe_points(scene: bpy.types.Scene) -> list[Vector]:
         points: list[Vector] = []
         for f in sorted(times):
             scene.frame_set(f)
+            # Force depsgraph re-evaluation — ``scene.frame_set`` alone
+            # doesn't always propagate through drivers / constraint stacks,
+            # so the pose-bone matrix would otherwise read stale values.
+            bpy.context.view_layer.update()
             world = (arm.matrix_world @ root_pb.matrix).translation
             points.append(Vector((world.x, world.y, 0.0)))
         return points
@@ -248,15 +252,24 @@ def _root_keyframe_points(scene: bpy.types.Scene) -> list[Vector]:
 
 
 def _joint_items_callback(self, context):
-    """Joint names from the target armature, for the effector-target popup."""
+    """End-effector joints from the target armature, for the pin popup.
+
+    Restricted to the four canonical limb tips
+    (``constants.END_EFFECTOR_JOINTS``); pinning interior chain joints
+    over-constrains the IK solver. Joints absent from the armature are
+    filtered out so the popup only offers what can actually be pinned.
+    """
     settings = context.scene.proscenium
     arm = settings.target_armature
     if arm is None or arm.type != 'ARMATURE':
         return [("", "(set a target armature first)", "")]
-    items = []
-    for pb in arm.pose.bones:
-        items.append((pb.name, pb.name, ""))
-    return items or [("", "(armature has no pose bones)", "")]
+    pose_bones = {pb.name for pb in arm.pose.bones}
+    items = [
+        (name, name, "")
+        for name in constants.END_EFFECTOR_JOINTS
+        if name in pose_bones
+    ]
+    return items or [("", "(armature has no canonical end-effector joints)", "")]
 
 
 class PROSCENIUM_OT_add_effector_target(Operator):
@@ -467,6 +480,12 @@ def sample_effector_target(
     try:
         for f in sorted_frames:
             scene.frame_set(f)
+            # Force depsgraph re-evaluation — ``scene.frame_set`` alone
+            # doesn't always propagate through drivers / parent chains /
+            # constraint stacks, so ``matrix_world`` would otherwise read
+            # the *previous* frame's translation. Same fix is applied in
+            # ``sample_pose_keyframes``; keep them in sync.
+            bpy.context.view_layer.update()
             world = empty_obj.matrix_world.translation
             mx, my, mz = coords.blender_pos_to_mmcp(world)
             positions.append([mx, my, mz])

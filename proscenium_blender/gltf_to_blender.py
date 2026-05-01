@@ -927,7 +927,7 @@ def bake_single_pose(
     source_frame: int,
     target_frame: int,
     sample_index: int = 0,
-    skip_root_translation: bool = True,
+    root_translation: str = "skip",
 ) -> int:
     """Insert one keyframe per joint at ``target_frame`` in the armature's
     active action, reading rotations from ``gltf``'s ``sample_index`` at
@@ -970,11 +970,16 @@ def bake_single_pose(
     mw_rot = armature_obj.matrix_world.to_quaternion().to_matrix()
     mw_rot_t = mw_rot.transposed()
 
+    if root_translation not in ("skip", "height_only", "full"):
+        raise ValueError(
+            f"root_translation must be 'skip', 'height_only', or 'full', got {root_translation!r}"
+        )
+
     written = 0
     for ch in channels:
         target = ch.get("target") or {}
         path = target.get("path")
-        if path == TRANSLATION_PATH and skip_root_translation:
+        if path == TRANSLATION_PATH and root_translation == "skip":
             continue
         if path not in (ROTATION_PATH, TRANSLATION_PATH):
             continue
@@ -1007,8 +1012,20 @@ def bake_single_pose(
             if source_frame * 3 + 3 > len(vec3s):
                 continue
             p_mmcp = tuple(vec3s[source_frame * 3:(source_frame + 1) * 3])
-            world = Vector(coords.mmcp_pos_to_blender(p_mmcp))
-            arm_local = armature_obj.matrix_world.inverted() @ world
+            pose_world = Vector(coords.mmcp_pos_to_blender(p_mmcp))
+
+            if root_translation == "height_only":
+                # Keep the bone's current world xy (whatever the user has
+                # placed the rig at, including any prior keyframe at this
+                # frame) and only override world z with the generated pose's
+                # height. Lets a "crouching" pose drop toward the floor
+                # without yanking the character to the canonical origin in xy.
+                current_world = armature_obj.matrix_world @ bone.head
+                target_world = Vector((current_world.x, current_world.y, pose_world.z))
+            else:  # "full"
+                target_world = pose_world
+
+            arm_local = armature_obj.matrix_world.inverted() @ target_world
             delta = arm_local - bone.bone.head_local
             bone.location = ML.transposed() @ delta
             bone.keyframe_insert(data_path="location", frame=target_frame)

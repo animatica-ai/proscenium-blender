@@ -415,6 +415,16 @@ class ProsceniumSettings(PropertyGroup):
         description="Text prompt for motion generation",
     )
 
+    last_pose_prompt: StringProperty(
+        name="Last pose prompt",
+        default="a person stands in a neutral pose",
+        description=(
+            "Most-recent prompt used in the Generate Pose dialog. "
+            "Pre-fills the dialog the next time it opens so the user "
+            "can iterate on a phrasing without retyping"
+        ),
+    )
+
     # -- Runtime state (not saved) --
     is_generating: BoolProperty(name="Generating", default=False)
     generation_progress: FloatProperty(

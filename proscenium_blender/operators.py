@@ -19,7 +19,7 @@ from __future__ import annotations
 import threading
 
 import bpy
-from bpy.props import IntProperty, StringProperty
+from bpy.props import BoolProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
 from . import (
@@ -360,12 +360,29 @@ class PROSCENIUM_OT_generate_pose(Operator):
         default="a person stands in a neutral pose",
     )
     seed: IntProperty(name="Seed", default=42, min=0, max=999999)
+    preserve_height: BoolProperty(
+        name="Preserve height",
+        description=(
+            "Keep the root's current world height. When unchecked (default), "
+            "the root's world Z is overridden by the generated pose's height "
+            "(XY stays put), so a 'crouching' pose actually drops the character "
+            "toward the floor and a 'jumping' pose lifts them"
+        ),
+        default=False,
+    )
 
+    # NOTE: keep these as plain class attributes (no type hints). Blender's
+    # operator-registration walks ``__annotations__`` to resolve the class's
+    # ``StringProperty``/``IntProperty``/``BoolProperty`` declarations into
+    # RNA properties; under ``from __future__ import annotations`` every
+    # annotation is a string and Blender's resolver chokes on the non-Property
+    # ones (e.g. ``threading.Thread | None``), dropping ALL annotations for
+    # the class — which makes the whole dialog go blank.
     _timer = None
-    _thread: threading.Thread | None = None
-    _result: dict | None = None
-    _error: Exception | None = None
-    _target_frame: int = 1
+    _thread = None
+    _result = None
+    _error = None
+    _target_frame = 1
 
     @classmethod
     def poll(cls, context):
@@ -380,8 +397,11 @@ class PROSCENIUM_OT_generate_pose(Operator):
     # ----- UI --------------------------------------------------------------
     def invoke(self, context, event):
         s = context.scene.proscenium
-        if getattr(s, "default_prompt", ""):
-            self.prompt = s.default_prompt
+        # Pre-fill from the most recent pose prompt the user submitted in
+        # this scene; falls back to the property's default on first use.
+        last = getattr(s, "last_pose_prompt", "")
+        if last:
+            self.prompt = last
         self.seed = int(s.seed)
         return context.window_manager.invoke_props_dialog(self)
 
@@ -389,6 +409,7 @@ class PROSCENIUM_OT_generate_pose(Operator):
         layout = self.layout
         layout.prop(self, "prompt")
         layout.prop(self, "seed")
+        layout.prop(self, "preserve_height")
         layout.label(text=f"Insert keyframe at frame {context.scene.frame_current}")
 
     # ----- entry -----------------------------------------------------------
@@ -413,6 +434,12 @@ class PROSCENIUM_OT_generate_pose(Operator):
                         "Server does not advertise the 'pose' segment type. "
                         "Pose generation is an Animatica Cloud feature.")
             return {'CANCELLED'}
+
+        # Persist the prompt to the scene so the next dialog open pre-fills
+        # with what the user just submitted — kept here (after capability
+        # checks pass) so a typo + cancel doesn't overwrite the previous
+        # known-good prompt.
+        s.last_pose_prompt = self.prompt
 
         # Send the user's own armature skeleton — the server retargets it to
         # the canonical on the way in and back again on the way out.
@@ -518,7 +545,7 @@ class PROSCENIUM_OT_generate_pose(Operator):
                 source_frame=0,
                 target_frame=self._target_frame,
                 sample_index=0,
-                skip_root_translation=True,
+                root_translation="skip" if self.preserve_height else "height_only",
             )
         except Exception as exc:                         # noqa: BLE001
             self._cleanup(context)
