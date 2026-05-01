@@ -136,6 +136,30 @@ def _target_armature_update(self, context):
                 area.tag_redraw()
 
 
+def _inplace_update(self, context):
+    """Live toggle for In-place mode — adds or removes a Limit Location
+    constraint on the target armature's root bone. The constraint pins
+    bone-local X / Z to 0 (Y free), so the character animates in place
+    horizontally while vertical motion (jumps, crouches) still plays.
+
+    Non-destructive: fcurves are untouched, flipping the toggle off
+    restores the original travel without re-generating. The constraint
+    only lives during preview; Accept zeroes the xz keyframes and removes
+    the constraint, baking the in-place result into the final actions.
+
+    Imports operators lazily to dodge the circular ``properties ->
+    operators -> properties`` chain at module load.
+    """
+    arm = self.target_armature
+    if arm is None or arm.type != 'ARMATURE':
+        return
+    from . import operators  # noqa: PLC0415 — lazy to avoid circular import
+    operators._apply_inplace_constraint(arm, enabled=bool(self.inplace))
+
+    # Tag the depsgraph so the viewport reflects the constraint change.
+    arm.update_tag()
+
+
 # ---------------------------------------------------------------------------
 # Classes
 # ---------------------------------------------------------------------------
@@ -391,6 +415,20 @@ class ProsceniumSettings(PropertyGroup):
         ),
         default=True,
     )
+    inplace: BoolProperty(
+        name="In place",
+        description=(
+            "Suppress the root bone's horizontal translation so the "
+            "character animates in place instead of travelling through "
+            "the scene. Vertical motion (jumps, crouches) is kept. Toggle "
+            "live after generation — the xz keyframes are kept but muted, "
+            "so switching back off restores the original travel without "
+            "re-generating. Useful for game-style cycles (walk loops, "
+            "idles) where the root motion comes from a controller"
+        ),
+        default=False,
+        update=_inplace_update,
+    )
     preview_path_snap: BoolProperty(
         name="Snap to Path",
         description=(
@@ -453,11 +491,24 @@ class ProsceniumSettings(PropertyGroup):
 
     # -- Preview state: name of the user's source action while a
     #    Proscenium_Motion (or legacy Proscenium_Generated) action is
-    #    being previewed.  Empty = idle.
+    #    being previewed.  Empty when free-form generation runs (no
+    #    source to fall back to) — the ``is_previewing`` flag tracks
+    #    preview state independently for that case.
     source_action_name: StringProperty(
         name="Source Action",
         default="",
         description="Original action name preserved while previewing a generated motion",
+    )
+    is_previewing: BoolProperty(
+        name="Previewing",
+        default=False,
+        description=(
+            "Set true while a Proscenium-generated motion is being "
+            "reviewed (Push to NLA / Reject visible). Independent of "
+            "source_action_name so free-form generations — where "
+            "there's no prior action to restore — also surface the "
+            "preview UI"
+        ),
     )
 
 

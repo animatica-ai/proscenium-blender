@@ -175,6 +175,101 @@ def _clear_proscenium_nla_tracks(armature_obj) -> None:
             nla.remove(track)
 
 
+def _root_location_data_path(armature_obj) -> str | None:
+    """The fcurve data_path that drives the armature's root-bone location."""
+    if armature_obj is None or armature_obj.type != 'ARMATURE':
+        return None
+    root_bone = next(
+        (pb for pb in armature_obj.pose.bones if pb.parent is None),
+        None,
+    )
+    if root_bone is None:
+        return None
+    return f'pose.bones["{root_bone.name}"].location'
+
+
+def _proscenium_motion_actions() -> list:
+    """Every motion-bake action the addon owns (current and legacy names)."""
+    return [
+        a for a in bpy.data.actions
+        if a.name.startswith(request_builder._GENERATED_ACTION_PREFIXES)
+    ]
+
+
+_INPLACE_CONSTRAINT_NAME = "Proscenium_InPlace"
+
+
+def _apply_inplace_constraint(armature_obj, enabled: bool) -> None:
+    """Add or remove a Limit Location constraint on the armature's root bone
+    that pins bone-local X / Z to 0.
+
+    Non-destructive — fcurves remain untouched, so flipping the toggle off
+    restores the original travel without re-generating. Y is left
+    unconstrained so vertical motion (jumps, crouches) still plays.
+
+    Used for live preview-time toggling. At Accept, the constraint is
+    "baked" by zeroing the X/Z fcurve values on the per-block actions and
+    then removing the constraint, so the final motion data is genuinely
+    travel-free without relying on a constraint persisting on the rig.
+    """
+    if armature_obj is None or armature_obj.type != 'ARMATURE':
+        return
+    root_bone = next(
+        (pb for pb in armature_obj.pose.bones if pb.parent is None),
+        None,
+    )
+    if root_bone is None:
+        return
+
+    existing = root_bone.constraints.get(_INPLACE_CONSTRAINT_NAME)
+    if enabled:
+        con = existing or root_bone.constraints.new('LIMIT_LOCATION')
+        con.name = _INPLACE_CONSTRAINT_NAME
+        # Pin X = 0 (bone-local).
+        con.use_min_x = True
+        con.use_max_x = True
+        con.min_x = 0.0
+        con.max_x = 0.0
+        # Pin Z = 0.
+        con.use_min_z = True
+        con.use_max_z = True
+        con.min_z = 0.0
+        con.max_z = 0.0
+        # Y unconstrained — vertical motion stays.
+        con.use_min_y = False
+        con.use_max_y = False
+        con.owner_space = 'LOCAL'
+        con.influence = 1.0
+        con.mute = False
+    else:
+        if existing is not None:
+            root_bone.constraints.remove(existing)
+
+
+def _zero_root_xz_keyframes(action, armature_obj) -> int:
+    """Set every root-bone X / Z location keyframe in ``action`` to 0.
+
+    Used at Accept time when the In-place toggle is on, so the final per-
+    block actions don't carry the original travel as inert keyframe data.
+    Returns the number of fcurves modified.
+    """
+    target_path = _root_location_data_path(armature_obj)
+    if target_path is None:
+        return 0
+    n = 0
+    for fc in constraints_ui.iter_action_fcurves(action):
+        if fc.data_path == target_path and fc.array_index in (0, 2):
+            for kp in fc.keyframe_points:
+                kp.co[1] = 0.0
+                # Flatten handles too, otherwise easing curves might wobble
+                # around the new 0.
+                kp.handle_left[1] = 0.0
+                kp.handle_right[1] = 0.0
+            fc.update()
+            n += 1
+    return n
+
+
 def _split_action_into_blocks(
     source_action,
     armature_obj,
@@ -218,6 +313,11 @@ def _split_action_into_blocks(
                 data_path=src_fc.data_path,
                 index=src_fc.array_index,
             )
+            # Carry the mute flag — without this the In-place toggle's live
+            # effect is lost the moment the user clicks Push to NLA (the
+            # split would create fresh fcurves with mute=False, defeating
+            # the user's intent).
+            new_fc.mute = src_fc.mute
             n = len(in_range)
             new_fc.keyframe_points.add(n)
             flat = [0.0] * (2 * n)
@@ -508,6 +608,19 @@ class PROSCENIUM_OT_generate(Operator):
             n_actions = 1
             skipped = list(action.get("proscenium_skipped_joints") or [])
 
+            # In-place mode: drop a Limit Location constraint on the root
+            # so the character is pinned at bone-local xz=0 while still
+            # playing vertical motion. Toggling the property afterwards
+            # adds/removes the constraint live via its update callback;
+            # this branch is just for the "toggle was already on when the
+            # bake completed" case.
+            if getattr(settings, "inplace", False):
+                _apply_inplace_constraint(settings.target_armature, enabled=True)
+            else:
+                # Defensive: if a stale constraint lingers from a prior
+                # session, clear it.
+                _apply_inplace_constraint(settings.target_armature, enabled=False)
+
             arm = settings.target_armature
             if block_ranges:
                 # Stash split metadata for Accept. Blender's ID-property
@@ -545,21 +658,26 @@ class PROSCENIUM_OT_generate(Operator):
         return {'FINISHED'}
 
     def _cleanup(self, context, *, preview: bool = False) -> None:
-        # ``preview=True`` is set only by the success path so the
-        # Accept / Reject UI can show. Every CANCELLED path leaves
-        # ``preview`` at its default ``False`` and we drop the source
-        # reference here — without this, a failed worker (e.g. a
-        # quota-exceeded 429) would surface the preview UI even though
-        # no motion was baked.
+        # ``preview=True`` is set only by the success path so the Accept /
+        # Reject UI can show. Every CANCELLED path leaves ``preview`` at
+        # its default ``False`` and we drop the source reference here —
+        # without this, a failed worker (e.g. a quota-exceeded 429) would
+        # surface the preview UI even though no motion was baked.
+        s = context.scene.proscenium
         if not preview:
-            context.scene.proscenium.source_action_name = ""
+            s.source_action_name = ""
+            s.is_previewing = False
+        else:
+            # Source-action name may be empty for free-form generations
+            # (no prior action to fall back to); ``is_previewing`` tracks
+            # the preview UI independently so the panel still surfaces.
+            s.is_previewing = True
         if self._timer is not None:
             try:
                 context.window_manager.event_timer_remove(self._timer)
             except Exception:
                 pass
             self._timer = None
-        s = context.scene.proscenium
         s.is_generating = False
         s.cancel_requested = False
 
@@ -648,13 +766,27 @@ class PROSCENIUM_OT_accept(Operator):
                 arm.animation_data.action = None
 
             if actions_to_push:
+                # If In place was on during preview, bake it: zero the X /
+                # Z keyframes on every per-block action's root-bone
+                # location fcurves, then remove the constraint. End state
+                # is travel-free fcurve data on disk — survives across
+                # regenerations, exports, and constraint stack edits.
+                if bool(getattr(s, "inplace", False)):
+                    for a in actions_to_push:
+                        _zero_root_xz_keyframes(a, arm)
+
                 _push_actions_to_nla(arm, actions_to_push)
                 n_pushed = len(actions_to_push)
+
+            # Always pull the constraint after Accept — its job is done
+            # (either we baked the in-place state or the toggle was off).
+            _apply_inplace_constraint(arm, enabled=False)
 
             if "proscenium_pending_block_ranges" in arm:
                 del arm["proscenium_pending_block_ranges"]
 
         s.source_action_name = ""
+        s.is_previewing = False
         if n_pushed:
             label = "strip" if n_pushed == 1 else "strips"
             self.report(
@@ -681,10 +813,10 @@ class PROSCENIUM_OT_reject(Operator):
             self.report({'ERROR'}, "Target armature is gone")
             return {'CANCELLED'}
 
+        # ``source`` is None for free-form generations (no prior action to
+        # restore to). That's fine — we still need to clean up the preview
+        # state, just without restoring anything.
         source = bpy.data.actions.get(s.source_action_name) if s.source_action_name else None
-        if source is None:
-            self.report({'WARNING'}, f"Source action {s.source_action_name!r} not found")
-            return {'CANCELLED'}
 
         if arm.animation_data is None:
             arm.animation_data_create()
@@ -694,11 +826,16 @@ class PROSCENIUM_OT_reject(Operator):
         # they don't keep playing on top.
         _clear_proscenium_nla_tracks(arm)
 
+        # Drop any in-place constraint left over from preview state.
+        _apply_inplace_constraint(arm, enabled=False)
+
         # Drop the pending-block-ranges stash — the preview action it
         # described is about to be orphaned and removed below.
         if "proscenium_pending_block_ranges" in arm:
             del arm["proscenium_pending_block_ranges"]
 
+        # Restore the source action when we have one; otherwise just detach
+        # the preview so the rig goes back to its un-animated state.
         arm.animation_data.action = source
 
         # Drop motion-bake orphans. Multi-block bakes mark each per-block
@@ -717,7 +854,11 @@ class PROSCENIUM_OT_reject(Operator):
             bpy.data.actions.remove(ac)
 
         s.source_action_name = ""
-        self.report({'INFO'}, f"Restored source action {source.name!r}")
+        s.is_previewing = False
+        if source is not None:
+            self.report({'INFO'}, f"Restored source action {source.name!r}")
+        else:
+            self.report({'INFO'}, "Discarded preview")
         return {'FINISHED'}
 
 

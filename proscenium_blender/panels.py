@@ -103,7 +103,11 @@ class PROSCENIUM_PT_main(ProsceniumPanelBase, Panel):
             col.prop(settings, "generation_progress", text="Generating...", slider=True)
             col.operator("proscenium.cancel", icon='X', text="Cancel")
         else:
-            in_preview = bool(settings.source_action_name)
+            # Use the dedicated preview flag — ``source_action_name`` is
+            # empty for free-form generations (no prior action to restore
+            # to), so gating on it would hide the Push to NLA / Reject
+            # buttons after a successful free-form bake.
+            in_preview = bool(getattr(settings, "is_previewing", False)) or bool(settings.source_action_name)
 
             col = layout.column(align=True)
             col.enabled = settings.target_armature is not None
@@ -130,6 +134,12 @@ class PROSCENIUM_PT_main(ProsceniumPanelBase, Panel):
                 layout.separator()
                 box = layout.box()
                 box.label(text="Preview", icon='INFO')
+                # In-place toggle lives here so it's only surfaced when
+                # there's a preview to apply it to. Non-destructive: live-
+                # toggle adds / removes a Limit Location constraint on the
+                # root bone; Accept bakes the result into the final
+                # per-block actions.
+                box.prop(settings, "inplace", icon='LOCKED' if settings.inplace else 'UNLOCKED')
                 row = box.row(align=True)
                 row.scale_y = 1.3
                 row.operator("proscenium.accept", icon='CHECKMARK')
@@ -250,6 +260,8 @@ class PROSCENIUM_PT_settings(ProsceniumPanelBase, Panel):
         # Motion cleanup — tightens keyframe pins and fixes foot skating.
         # Requires the server to have `motion_correction` installed.
         layout.prop(settings, "post_processing")
+        # Note: the In-place toggle lives in the Preview box on the main
+        # panel — it's only meaningful while reviewing a generation.
 
 
 # ═══════════════════════════════════════════════════════════════════════════
