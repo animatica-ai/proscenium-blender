@@ -452,7 +452,8 @@ class ProsceniumSettings(PropertyGroup):
     )
 
     # -- Preview state: name of the user's source action while a
-    #    Proscenium_Generated action is being previewed.  Empty = idle.
+    #    Proscenium_Motion (or legacy Proscenium_Generated) action is
+    #    being previewed.  Empty = idle.
     source_action_name: StringProperty(
         name="Source Action",
         default="",

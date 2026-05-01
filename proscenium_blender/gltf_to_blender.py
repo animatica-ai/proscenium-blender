@@ -69,7 +69,7 @@ def bake_gltf_to_armature(
     armature_obj: bpy.types.Object,
     *,
     sample_index: int = 0,
-    action_name: str = "Proscenium_Generated",
+    action_name: str = "Proscenium_Motion",
     start_frame: int = 1,
     anchor_frames: set[int] | None = None,
 ) -> bpy.types.Action:
@@ -958,7 +958,7 @@ def bake_single_pose(
     if armature_obj.animation_data is None:
         armature_obj.animation_data_create()
     if armature_obj.animation_data.action is None:
-        armature_obj.animation_data.action = bpy.data.actions.new("Proscenium_Poses")
+        armature_obj.animation_data.action = bpy.data.actions.new("Proscenium_Pose")
 
     pose = armature_obj.pose
     for pb in pose.bones:

@@ -30,7 +30,41 @@ from . import (
 )
 
 
-GENERATED_ACTION_NAME = "Proscenium_Generated"
+MOTION_ACTION_PREFIX = "Proscenium_Motion"
+POSE_ACTION_NAME     = "Proscenium_Pose"
+
+# Kept for back-compat with action references in older scenes — older bakes
+# wrote to ``Proscenium_Generated``; the prefix filter (``Proscenium_``) in
+# request_builder catches both old and new naming.
+GENERATED_ACTION_NAME = MOTION_ACTION_PREFIX
+
+
+def _build_motion_action_name(prompt_blocks) -> str:
+    """Descriptive Blender action name for a motion bake.
+
+    Picks the first enabled prompt block's text as the descriptive suffix,
+    truncated so the full name stays under Blender's 64-char action-name
+    limit. Falls back to ``MOTION_ACTION_PREFIX`` alone when no prompt is
+    available (constraint-only generations). Subsequent regenerations get
+    Blender's automatic ``.001`` / ``.002`` suffixes for free.
+    """
+    label = ""
+    for b in prompt_blocks or ():
+        if not getattr(b, "enabled", True):
+            continue
+        text = (b.prompt or "").strip()
+        if text:
+            label = text
+            break
+    if not label:
+        return MOTION_ACTION_PREFIX
+    name = f"{MOTION_ACTION_PREFIX}: {label}"
+    # Blender allows up to 63 chars; clamp with an ellipsis a few chars under
+    # so the auto-suffixer has room for ``.001``-style tags.
+    MAX = 56
+    if len(name) > MAX:
+        name = name[:MAX - 1] + "…"
+    return name
 
 
 def _stash_quota_state(settings, exc) -> None:
@@ -157,16 +191,52 @@ class PROSCENIUM_OT_generate(Operator):
 
         # Remember which scene-frames the user actually keyed so we can tag
         # them ``'KEYFRAME'`` after the bake (while every other frame from
-        # the generated timeline gets tagged ``'GENERATED'``). Pose_keyframe
-        # ``frame`` is a timeline-relative index (0 = scene.frame_start);
-        # shift by ``frame_start`` to get the scene-space frame the bake
-        # will write to.
-        scene_start = int(context.scene.frame_start)
-        anchor_frames = {
-            int(c["frame"]) + scene_start
-            for c in req.get("constraints", [])
-            if c.get("type") == "pose_keyframe"
-        }
+        # the generated timeline gets tagged ``'GENERATED'``). Three sources
+        # contribute, all collapsed to scene-frame space:
+        #   1. ``pose_keyframe`` constraints — frame index is timeline-
+        #      relative (0 = request's first frame), so shift by gen_start.
+        #   2. ``effector_target`` constraints — same timeline-relative
+        #      indexing.
+        #   3. Every keyframe on the source action's fcurves, regardless of
+        #      channel. This catches location-only keys (e.g. root-bone
+        #      path animation) and scale keys that the pose_keyframe
+        #      sampler filters out (it only emits constraints from rotation
+        #      fcurves), so a hand-authored Hips path stays visually
+        #      distinguishable from the generated motion afterwards.
+        gen_start, gen_end = request_builder.compute_frame_range(
+            settings.prompt_blocks, arm, context.scene
+        )
+        self._gen_start_frame = gen_start
+
+        anchor_frames: set[int] = set()
+        for c in req.get("constraints", []):
+            t = c.get("type")
+            if t == "pose_keyframe":
+                anchor_frames.add(int(c["frame"]) + gen_start)
+            elif t == "effector_target":
+                for f in c.get("frames", []) or ():
+                    anchor_frames.add(int(f) + gen_start)
+            # root_path frames come from evenly-spaced curve sampling, not
+            # from user keyframes — skip them.
+
+        src_action = (
+            arm.animation_data.action
+            if arm.animation_data and arm.animation_data.action
+            else None
+        )
+        # Only motion-bake output is excluded — pose-generator output
+        # (``Proscenium_Pose`` / legacy ``Proscenium_Poses``) is the user's
+        # authored content (they chose to keep those poses as anchors), so
+        # those keyframes should stay typed as ``KEYFRAME`` after the bake.
+        if src_action is not None and not src_action.name.startswith(
+            request_builder._GENERATED_ACTION_PREFIXES
+        ):
+            for fc in constraints_ui.iter_action_fcurves(src_action):
+                for kp in fc.keyframe_points:
+                    f = int(round(kp.co.x))
+                    if gen_start <= f <= gen_end:
+                        anchor_frames.add(f)
+
         self._anchor_frames = anchor_frames
 
         # Reset state and kick worker.
@@ -230,8 +300,10 @@ class PROSCENIUM_OT_generate(Operator):
                 self._result,
                 settings.target_armature,
                 sample_index=0,
-                action_name=GENERATED_ACTION_NAME,
-                start_frame=context.scene.frame_start,
+                action_name=_build_motion_action_name(settings.prompt_blocks),
+                start_frame=getattr(
+                    self, "_gen_start_frame", context.scene.frame_start
+                ),
                 anchor_frames=getattr(self, "_anchor_frames", None),
             )
         except Exception as exc:                         # noqa: BLE001 — surfaced to UI
@@ -297,7 +369,7 @@ class PROSCENIUM_OT_accept(Operator):
     bl_idname = "proscenium.accept"
     bl_label = "Accept"
     bl_description = (
-        f"Keep the generated motion. The {GENERATED_ACTION_NAME} action stays "
+        "Keep the generated motion. The generated Proscenium action stays "
         "as the armature's active action; the source action reference is released"
     )
 
@@ -331,9 +403,13 @@ class PROSCENIUM_OT_reject(Operator):
             arm.animation_data_create()
         arm.animation_data.action = source
 
-        # Drop any orphaned generated actions so they don't pile up.
+        # Drop any orphaned motion-bake outputs so they don't pile up.
+        # Match on the motion-only prefix tuple — pose-generator actions
+        # (``Proscenium_Pose`` / legacy ``Proscenium_Poses``) are user-
+        # authored anchors and stay even when not currently assigned.
         for ac in [a for a in bpy.data.actions
-                   if a.name.startswith(GENERATED_ACTION_NAME) and a.users == 0]:
+                   if a.name.startswith(request_builder._GENERATED_ACTION_PREFIXES)
+                   and a.users == 0]:
             bpy.data.actions.remove(ac)
 
         s.source_action_name = ""

@@ -7,7 +7,7 @@ own the action handling. The addon's operator always calls
 want and rules out single-frame use (the operator bakes the action's
 full frame range). Owning the bake lets us:
 
-  * Keep our action name (e.g. ``Proscenium_Generated``).
+  * Keep our action name (e.g. ``Proscenium_Motion: <prompt>``).
   * Take an explicit ``frame_start``/``frame_end`` — works for the full
     multi-frame generate path *and* the single-frame text-to-pose path.
   * Skip the addon's ``redefine_source_rest_pose`` step. The addon needs

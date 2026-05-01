@@ -32,6 +32,57 @@ class BuildError(Exception):
 # Public entry point
 # ---------------------------------------------------------------------------
 
+def compute_frame_range(
+    prompt_blocks,
+    armature_obj: bpy.types.Object | None,
+    scene: bpy.types.Scene,
+) -> tuple[int, int]:
+    """The generation window — union of every piece of user-authored timing
+    content on the timeline.
+
+    Pulls from:
+      * Enabled ``PromptBlock`` ranges (the addon's "actions" — text segments
+        drawn on the timeline strip).
+      * The target armature's active source action keyframe span (skipping
+        Proscenium-generated bakes so a regenerate doesn't latch onto its
+        own previous output).
+
+    Falls back to ``scene.frame_start..scene.frame_end`` only when nothing's
+    been authored. Caller-side, this replaces the older "scene-range is the
+    request length" heuristic — generating only as far as the user actually
+    drew content keeps short-segment edits from paying for an empty 120-frame
+    tail.
+    """
+    starts: list[int] = []
+    ends: list[int] = []
+
+    for b in prompt_blocks or ():
+        if not getattr(b, "enabled", True):
+            continue
+        starts.append(int(b.frame_start))
+        ends.append(int(b.frame_end))
+
+    src = (
+        armature_obj.animation_data.action
+        if armature_obj is not None
+        and armature_obj.animation_data
+        and armature_obj.animation_data.action
+        else None
+    )
+    if src is not None and not src.name.startswith(_GENERATED_ACTION_PREFIX):
+        kfs: set[int] = set()
+        for fc in constraints_ui.iter_action_fcurves(src):
+            for kp in fc.keyframe_points:
+                kfs.add(int(round(kp.co.x)))
+        if kfs:
+            starts.append(min(kfs))
+            ends.append(max(kfs))
+
+    if starts and ends:
+        return (min(starts), max(ends))
+    return (int(scene.frame_start), int(scene.frame_end))
+
+
 def build_request(
     *,
     model_id: str,
@@ -72,7 +123,7 @@ def build_request(
             )
         request_skeleton = canonical                  # echo verbatim
 
-    frame_range = (int(scene.frame_start), int(scene.frame_end))
+    frame_range = compute_frame_range(prompt_blocks, armature_obj, scene)
     segments = build_segments(prompt_blocks, frame_range)
 
     # Total timeline length matches the scene range so frames in constraints
@@ -305,7 +356,13 @@ def build_segments(prompt_blocks, frame_range: tuple[int, int]) -> list[dict[str
 # Constraints
 # ---------------------------------------------------------------------------
 
-_GENERATED_ACTION_PREFIX = "Proscenium_Generated"
+_GENERATED_ACTION_PREFIXES: tuple[str, ...] = (
+    "Proscenium_Motion",     # current motion-bake naming
+    "Proscenium_Generated",  # legacy motion-bake naming
+)
+# Kept for back-compat in case anything imports it; ``str.startswith`` accepts
+# either a string or a tuple, so the change is transparent at call sites.
+_GENERATED_ACTION_PREFIX = _GENERATED_ACTION_PREFIXES
 
 
 def _collect_constraints(
