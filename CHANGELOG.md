@@ -4,6 +4,37 @@ All notable changes to the Proscenium for Blender addon are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1] — 2026-05-08
+
+### Added
+
+- **In-place motion (preview).** Scene setting pins the root bone’s
+  horizontal translation with a `Limit Location` constraint during
+  preview so the character plays vertically in place. F-curves are left
+  intact; **Push to NLA** zeros root X/Z keys on the committed actions and
+  removes the constraint so the NLA data is genuinely travel-free.
+- **Agent skill (`skills/proscenium/SKILL.md`).** Cursor-oriented guide for
+  driving Proscenium via Blender MCP: async operators, polling, prompt
+  blocks, constraints, and known caveats.
+
+### Changed
+
+- **Root-path MMCP sampling.** Root-path curves share a world-space
+  polyline helper; heading is derived from the tangent in MMCP XZ with
+  `atan2(tx, tz)` so facing matches walk direction along the path.
+  Single-frame generation windows are supported instead of returning no
+  constraint. The auto **start anchor** can include `heading_radians`
+  when the curve has **Follow direction** enabled, so frame 0 is not sent
+  as translation-only with an arbitrary facing.
+
+### Fixed
+
+- **Snap to path vs. preview bake.** While `is_generating` or
+  `is_previewing`, path snap no longer rewrites the root’s horizontal
+  location curves from sparse Bezier control points, so dense glTF root
+  translation from `/generate` is not replaced (which looked like snapping
+  to the guide curve and foot sliding).
+
 ## [0.3.0] — 2026-05-01
 
 ### Added
@@ -90,6 +121,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release.
 
+[0.3.1]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.3.1
 [0.3.0]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.3.0
 [0.2.0]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.2.0
 [0.1.0]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.1.0
