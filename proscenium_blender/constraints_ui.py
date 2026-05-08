@@ -380,6 +380,45 @@ def _select_only(context, obj: bpy.types.Object) -> None:
 # Sampling — Blender object → MMCP constraint dict
 # ---------------------------------------------------------------------------
 
+def _mmcp_heading_from_xz_tangent(tx: float, tz: float) -> float:
+    """Yaw (radians) about MMCP +Y so the horizontal forward axis aligns with
+    tangent ``(tx, 0, tz)`` in MMCP space — ``atan2(tx, tz)`` is the angle in
+    the XZ plane from +Z toward +X (right-handed about +Y).
+    """
+    return math.atan2(tx, tz)
+
+
+def _root_path_world_polyline(curve_obj: bpy.types.Object) -> list[Vector] | None:
+    """World-space polyline sampled from a root-path curve, or ``None`` if
+    the spline cannot yield a tangent (missing data or fewer than two
+    distinct samples).
+    """
+    spline = curve_obj.data.splines[0] if curve_obj.data.splines else None
+    if spline is None or len(spline.bezier_points) < 2:
+        return None
+    local_polyline = _bezier_to_polyline(spline, segments_per_segment=12)
+    if len(local_polyline) < 2:
+        return None
+    mw = curve_obj.matrix_world
+    return [mw @ p for p in local_polyline]
+
+
+def root_path_heading_at_start(curve_obj: bpy.types.Object) -> float | None:
+    """MMCP ``heading_radians`` at the start of ``curve_obj``, or ``None`` if
+    direction matching is off or the curve has no usable tangent.
+
+    Uses the same tangent → heading mapping as :func:`sample_root_path`.
+    """
+    if not curve_obj.get(constants.PROP_MATCH_DIRECTION):
+        return None
+    polyline = _root_path_world_polyline(curve_obj)
+    if polyline is None:
+        return None
+    tangent = _tangent_at(polyline, 0)
+    tx, _, tz = coords.blender_pos_to_mmcp(tangent)
+    return _mmcp_heading_from_xz_tangent(tx, tz)
+
+
 def sample_root_path(
     curve_obj: bpy.types.Object,
     *,
@@ -392,20 +431,11 @@ def sample_root_path(
     indices in the request frame range. Returns ``None`` if the curve has no
     spline data (corrupt) or fewer than 2 points.
     """
-    if total_frames < 2:
+    if total_frames < 1:
         return None
-    spline = curve_obj.data.splines[0] if curve_obj.data.splines else None
-    if spline is None or len(spline.bezier_points) < 2:
+    polyline = _root_path_world_polyline(curve_obj)
+    if polyline is None:
         return None
-
-    local_polyline = _bezier_to_polyline(spline, segments_per_segment=12)
-    if len(local_polyline) < 2:
-        return None
-
-    # Transform the sampled points through the curve object's world matrix so
-    # moving the curve in the viewport moves the path the character follows.
-    mw = curve_obj.matrix_world
-    polyline = [mw @ p for p in local_polyline]
 
     density = max(1, int(curve_obj.get(constants.PROP_SAMPLE_DENSITY, 10)))
     frames = list(range(0, total_frames, density))
@@ -416,8 +446,9 @@ def sample_root_path(
     headings:     list[float] = []
 
     last_idx = len(polyline) - 1
+    denom = max(1, total_frames - 1)
     for f in frames:
-        t = f / (total_frames - 1)               # 0..1 along the curve
+        t = f / denom                          # 0..1 along the curve
         idx = max(0, min(last_idx, int(round(t * last_idx))))
         world = polyline[idx]
         x_mmcp, _, z_mmcp = coords.blender_pos_to_mmcp(world)
@@ -426,8 +457,7 @@ def sample_root_path(
         if curve_obj.get(constants.PROP_MATCH_DIRECTION):
             tangent = _tangent_at(polyline, idx)
             tx, _, tz = coords.blender_pos_to_mmcp(tangent)
-            # heading = 0 faces MMCP +Z; positive rotation about +Y takes +Z toward -X.
-            headings.append(math.atan2(-tx, tz))
+            headings.append(_mmcp_heading_from_xz_tangent(tx, tz))
 
     constraint: dict[str, Any] = {
         "type": "root_path",

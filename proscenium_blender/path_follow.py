@@ -175,6 +175,27 @@ world orientation. Do not infer it from ``arm.matrix_world`` — a Y-up rig
 with an identity world transform would otherwise resolve to axis 2."""
 
 
+def _snap_skips_target_during_generation_preview(
+    scene: bpy.types.Scene,
+    arm: bpy.types.Object,
+) -> bool:
+    """Path snap replaces root horizontal fcurves with **one key per Bezier
+    control point** spread across the scene range. A finished ``/generate``
+    bake instead has **dense per-frame** root translation from glTF.
+    Running snap after the bake (depsgraph fires when the curve evaluates,
+    or the user toggles snap) would wipe that trajectory and substitute a
+    coarse polyline — the character appears snapped to the guide curve with
+    obvious foot sliding. Skip sync while the target armature is mid-flight
+    or showing a preview bake.
+    """
+    s = getattr(scene, "proscenium", None)
+    if s is None:
+        return False
+    if arm != getattr(s, "target_armature", None):
+        return False
+    return bool(getattr(s, "is_generating", False) or getattr(s, "is_previewing", False))
+
+
 def sync_path_to_armature(
     arm: bpy.types.Object,
     scene: bpy.types.Scene,
@@ -190,6 +211,9 @@ def sync_path_to_armature(
     Returns True when any fcurve was written, False when everything was
     already in sync (used by the handler to suppress noisy re-entry).
     """
+    if _snap_skips_target_during_generation_preview(scene, arm):
+        return False
+
     points = _control_points_world(curve)
     if not points:
         return False
@@ -254,6 +278,8 @@ def _on_depsgraph_update(scene: bpy.types.Scene, depsgraph: bpy.types.Depsgraph)
         return
     arm = settings.target_armature
     if arm is None or arm.type != 'ARMATURE':
+        return
+    if _snap_skips_target_during_generation_preview(scene, arm):
         return
     curve = _find_root_path_curve(scene)
     if curve is None:

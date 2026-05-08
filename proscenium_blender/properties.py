@@ -95,6 +95,10 @@ def _preview_path_snap_update(self, context):
     """
     if not self.preview_path_snap:
         return
+    if getattr(self, "is_generating", False) or getattr(self, "is_previewing", False):
+        # Do not replace dense preview-bake root keys with sparse curve keys;
+        # see ``path_follow._snap_skips_target_during_generation_preview``.
+        return
     arm = self.target_armature
     if arm is None or arm.type != 'ARMATURE':
         return
@@ -435,7 +439,10 @@ class ProsceniumSettings(PropertyGroup):
             "Bake each root_path curve control point into one keyframe on "
             "the target armature's root bone. Turning this on syncs "
             "immediately from the current curve; leaving it on keeps the "
-            "keyframes in sync as you edit the curve in the viewport"
+            "keyframes in sync as you edit the curve in the viewport. "
+            "While a generation is running or a preview bake is active, "
+            "sync is paused so the returned root trajectory is not replaced "
+            "by sparse path keys (which looks like snapping and foot sliding)"
         ),
         default=True,
         update=_preview_path_snap_update,

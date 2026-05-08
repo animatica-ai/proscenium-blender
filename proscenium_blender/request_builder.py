@@ -7,7 +7,7 @@ and produces the request dict the ``mmcp_client`` POSTs to ``/generate``.
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Iterable
 
 import bpy
 from mathutils import Vector
@@ -410,7 +410,11 @@ def _collect_constraints(
     # stays stuck at (0, 0), which is what the user saw as "the first
     # keyframe gets reset to (0, 0)". Skip if another constraint already
     # pins frame 0.
-    anchor = _start_anchor(armature_obj, out)
+    anchor = _start_anchor(
+        armature_obj,
+        out,
+        constraint_objects.get("root_paths", ()),
+    )
     if anchor is not None:
         out.append(anchor)
 
@@ -420,6 +424,7 @@ def _collect_constraints(
 def _start_anchor(
     armature_obj: bpy.types.Object,
     existing: list[dict[str, Any]],
+    root_path_curves: Iterable[bpy.types.Object] = (),
 ) -> dict[str, Any] | None:
     if any(_pins_frame_zero(c) for c in existing):
         return None
@@ -431,11 +436,20 @@ def _start_anchor(
         return None
     root_world = (armature_obj.matrix_world @ root_pb.matrix).translation
     x, _, z = coords.blender_pos_to_mmcp(root_world)
-    return {
+    anchor: dict[str, Any] = {
         "type":         "root_path",
         "frames":       [0],
         "positions_xz": [[x, z]],
     }
+    # Match :func:`sample_root_path`: when a path curve opts into follow-
+    # direction, pin initial heading from the curve tangent so the model does
+    # not default to an arbitrary facing at frame 0.
+    for curve in root_path_curves:
+        h = constraints_ui.root_path_heading_at_start(curve)
+        if h is not None:
+            anchor["heading_radians"] = [h]
+            break
+    return anchor
 
 
 def _pins_frame_zero(c: dict[str, Any]) -> bool:
