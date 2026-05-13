@@ -88,6 +88,148 @@ def iter_action_fcurves(action):
                 yield from cb.fcurves
 
 
+def _iter_fcurve_collections(action):
+    """Yield each F-curve container on ``action`` (flat or per-channelbag),
+    so callers can mutate (add/remove fcurves) instead of just iterating."""
+    flat = getattr(action, "fcurves", None)
+    if flat is not None:
+        yield flat
+        return
+    for layer in getattr(action, "layers", ()):
+        for strip in getattr(layer, "strips", ()):
+            if not hasattr(strip, "channelbag"):
+                continue
+            for slot in getattr(action, "slots", ()):
+                cb = strip.channelbag(slot, ensure=False)
+                if cb is not None:
+                    yield cb.fcurves
+
+
+def strip_generated_keyframe_points(action) -> int:
+    """Remove ``GENERATED``-typed keyframe points from every F-curve on ``action``.
+
+    Motion bakes tag constraint anchors as ``KEYFRAME`` and dense samples as
+    ``GENERATED`` (see ``gltf_to_blender._tag_keyframe_types``). Reject should
+    drop only the generated samples so keys added while previewing are kept.
+    When any channel has an authored key at a frame, generated samples on
+    other channels at that same frame are promoted to ``KEYFRAME`` too — that
+    preserves the full-body pose at the authored frame instead of leaving
+    unkeyed bones at rest.
+
+    Returns the number of keyframe points removed. F-curves left with no
+    keys are removed.
+    """
+    if action is None:
+        return 0
+
+    authored_frames = {
+        int(round(kp.co.x))
+        for fc in iter_action_fcurves(action)
+        for kp in fc.keyframe_points
+        if kp.type != 'GENERATED'
+    }
+
+    removed = 0
+    for fcurves in _iter_fcurve_collections(action):
+        for fc in list(fcurves):
+            kps = fc.keyframe_points
+            for i in range(len(kps) - 1, -1, -1):
+                if kps[i].type != 'GENERATED':
+                    continue
+                if int(round(kps[i].co.x)) in authored_frames:
+                    kps[i].type = 'KEYFRAME'
+                    continue
+                kps.remove(kps[i])
+                removed += 1
+            fc.update()
+            if len(fc.keyframe_points) == 0:
+                fcurves.remove(fc)
+
+    return removed
+
+
+def _ensure_fcurve(action, data_path: str, array_index: int):
+    """Get the F-curve at ``(data_path, array_index)`` on ``action``, or
+    create one. Returns ``None`` if neither lookup nor creation succeeds.
+
+    Works for both flat (pre-Blender 4.4) and layered (4.4+) actions; on a
+    layered action the new curve goes onto the first existing channelbag,
+    which matches how the rest of this module reads fcurves back.
+    """
+    flat = getattr(action, "fcurves", None)
+    if flat is not None:
+        fc = flat.find(data_path=data_path, index=array_index)
+        if fc is not None:
+            return fc
+        try:
+            return flat.new(data_path=data_path, index=array_index)
+        except RuntimeError:
+            return None
+
+    for layer in getattr(action, "layers", ()):
+        for strip in getattr(layer, "strips", ()):
+            if not hasattr(strip, "channelbag"):
+                continue
+            for slot in getattr(action, "slots", ()):
+                cb = strip.channelbag(slot, ensure=False)
+                if cb is None:
+                    continue
+                fc = cb.fcurves.find(data_path=data_path, index=array_index)
+                if fc is not None:
+                    return fc
+                try:
+                    return cb.fcurves.new(data_path=data_path, index=array_index)
+                except RuntimeError:
+                    continue
+    return None
+
+
+def _copy_keyframe_point(src_kp, dest_fc) -> None:
+    """Insert or replace one key on ``dest_fc`` matching ``src_kp``'s frame.
+
+    ``keyframe_points.insert`` updates an existing key at the same frame in
+    place, so no explicit removal is needed.
+    """
+    dst = dest_fc.keyframe_points.insert(
+        float(src_kp.co.x),
+        float(src_kp.co.y),
+    )
+    dst.handle_left      = src_kp.handle_left
+    dst.handle_right     = src_kp.handle_right
+    dst.handle_left_type = src_kp.handle_left_type
+    dst.handle_right_type = src_kp.handle_right_type
+    dst.interpolation    = src_kp.interpolation
+    dst.easing           = src_kp.easing
+    dst.type             = src_kp.type
+
+
+def merge_preview_keyframes_into_source(source_action, preview_action) -> int:
+    """Copy keyframe points from ``preview_action`` onto matching F-curves
+    on ``source_action``. Existing keys at the same frame are replaced.
+
+    Used after ``strip_generated_keyframe_points`` on the preview: channels
+    that only had generated samples disappear from the preview, but
+    ``source_action`` keeps the pre-generation curves so the rig doesn't
+    fall back to rest pose on those bones.
+
+    Returns the number of keyframe points written.
+    """
+    if source_action is None or preview_action is None:
+        return 0
+
+    merged = 0
+    for prev_fc in iter_action_fcurves(preview_action):
+        dest_fc = _ensure_fcurve(source_action, prev_fc.data_path, prev_fc.array_index)
+        if dest_fc is None:
+            continue
+        for src_kp in sorted(prev_fc.keyframe_points, key=lambda kp: kp.co.x):
+            _copy_keyframe_point(src_kp, dest_fc)
+            merged += 1
+        dest_fc.update()
+
+    return merged
+
+
 # ---------------------------------------------------------------------------
 # Scene walker
 # ---------------------------------------------------------------------------

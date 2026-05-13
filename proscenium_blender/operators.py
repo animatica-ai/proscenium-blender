@@ -5,7 +5,7 @@ Operators:
     proscenium.generate          — build request, POST /generate, bake response
     proscenium.generate_pose     — single-frame variant (defined in step 8)
     proscenium.accept            — keep the generated motion, release source
-    proscenium.reject            — restore the source action
+    proscenium.reject            — strip generated samples from the preview action
     proscenium.cancel            — request cancellation of an in-flight gen
 
 The generate operator is modal: a worker thread does the blocking POST while
@@ -802,8 +802,10 @@ class PROSCENIUM_OT_reject(Operator):
     bl_idname = "proscenium.reject"
     bl_label = "Reject"
     bl_description = (
-        "Discard the generated motion and restore the source action so you "
-        "can edit and regenerate"
+        "Drop the generated motion samples while keeping authored keyframes "
+        "(both originally typed and any added during preview). When a "
+        "pre-generation source action exists, the kept keys are merged onto "
+        "it so bones the bake covered keep their pose at authored frames"
     )
 
     def execute(self, context):
@@ -813,37 +815,54 @@ class PROSCENIUM_OT_reject(Operator):
             self.report({'ERROR'}, "Target armature is gone")
             return {'CANCELLED'}
 
-        # ``source`` is None for free-form generations (no prior action to
-        # restore to). That's fine — we still need to clean up the preview
-        # state, just without restoring anything.
-        source = bpy.data.actions.get(s.source_action_name) if s.source_action_name else None
-
         if arm.animation_data is None:
             arm.animation_data_create()
 
-        # Defensive: if the user manually assembled the per-block actions
-        # onto NLA, strip our tracks before restoring the source action so
-        # they don't keep playing on top.
+        # ``source`` is the pre-generation action stashed by Generate. After
+        # stripping generated samples from the preview we merge the survivors
+        # onto ``source`` and assign it, so channels that only had generated
+        # keys still evaluate from the original curves (avoids T-pose).
+        source = bpy.data.actions.get(s.source_action_name) if s.source_action_name else None
+        preview = (
+            arm.animation_data.action
+            if arm.animation_data and arm.animation_data.action
+            else None
+        )
+        is_motion_preview = (
+            preview is not None
+            and preview.name.startswith(request_builder._GENERATED_ACTION_PREFIXES)
+        )
+
+        # Defensive: if the user manually assembled per-block actions onto
+        # NLA, strip our tracks before reassigning so they don't keep
+        # playing on top of the restored / cleaned action.
         _clear_proscenium_nla_tracks(arm)
 
         # Drop any in-place constraint left over from preview state.
         _apply_inplace_constraint(arm, enabled=False)
 
-        # Drop the pending-block-ranges stash — the preview action it
-        # described is about to be orphaned and removed below.
+        # Pending-block-ranges stash is only meaningful for Accept.
         if "proscenium_pending_block_ranges" in arm:
             del arm["proscenium_pending_block_ranges"]
 
-        # Restore the source action when we have one; otherwise just detach
-        # the preview so the rig goes back to its un-animated state.
-        arm.animation_data.action = source
+        n_rm = 0
+        if is_motion_preview:
+            n_rm = constraints_ui.strip_generated_keyframe_points(preview)
+            if source is not None:
+                constraints_ui.merge_preview_keyframes_into_source(source, preview)
+                arm.animation_data.action = source
+            else:
+                arm.animation_data.action = preview
+        else:
+            # Unexpected: preview isn't a motion bake. Fall back to assigning
+            # whatever ``source`` we have (or detach if none).
+            arm.animation_data.action = source
 
         # Drop motion-bake orphans. Multi-block bakes mark each per-block
         # action with ``use_fake_user`` so Blender doesn't purge them while
-        # the user is iterating; we have to look past that fake user when
-        # deciding what's truly orphaned. Pose-generator actions
-        # (``Proscenium_Pose`` / legacy ``Proscenium_Poses``) are user-
-        # authored anchors and stay regardless of whether they're assigned.
+        # the user iterates; we look past that fake user when deciding
+        # what's truly orphaned. Pose-generator actions are user-authored
+        # anchors and stay regardless of whether they're assigned.
         def _is_orphan(a):
             real_users = a.users - (1 if a.use_fake_user else 0)
             return real_users <= 0
@@ -855,7 +874,16 @@ class PROSCENIUM_OT_reject(Operator):
 
         s.source_action_name = ""
         s.is_previewing = False
-        if source is not None:
+
+        if is_motion_preview and source is not None:
+            self.report(
+                {'INFO'},
+                f"Restored {source.name!r}; merged authored keys, "
+                f"removed {n_rm} generated sample(s)",
+            )
+        elif is_motion_preview:
+            self.report({'INFO'}, f"Removed {n_rm} generated sample(s)")
+        elif source is not None:
             self.report({'INFO'}, f"Restored source action {source.name!r}")
         else:
             self.report({'INFO'}, "Discarded preview")
