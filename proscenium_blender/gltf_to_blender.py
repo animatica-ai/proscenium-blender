@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import base64
 import struct
-from typing import Any
+from typing import Any, Collection
 
 import bpy
 from mathutils import Matrix, Quaternion, Vector
@@ -1202,6 +1202,42 @@ def _tag_keys_at_frame_as_authored(action: bpy.types.Action, frame: int) -> None
 # Single-pose insertion (pose generator path — additive, non-destructive)
 # ---------------------------------------------------------------------------
 
+def resolve_pose_bake_joint_names(
+    armature_obj: bpy.types.Object,
+    selected_pose_bone_names: set[str],
+) -> set[str]:
+    """Map pose-bone names from the UI to glTF joint names for ``bake_single_pose``.
+
+    On a plain rig the returned set matches the selection (each name that
+    appears in the pose response is keyed as-is).
+
+    On a Mixamo-style control rig, selecting an IK handle or other control
+    bone expands to the deform bone(s) that drive the channels the server
+    returns (those constraints are discovered via ``_build_control_specs``).
+    """
+    from . import request_builder
+
+    out = set(selected_pose_bone_names)
+    if not request_builder.is_control_rig(armature_obj):
+        return out
+    specs = _build_control_specs(armature_obj)
+    extras: set[str] = set()
+    for name in selected_pose_bone_names:
+        spec = specs.get(name)
+        if spec is None:
+            continue
+        kind = spec[0]
+        if kind == "matrix":
+            extras.add(spec[1])
+        elif kind in ("rotation", "location_head", "location_tail"):
+            extras.add(spec[1])
+        elif kind == "pole":
+            extras.add(spec[1])
+            extras.add(spec[2])
+    out |= extras
+    return out
+
+
 def bake_single_pose(
     gltf: dict[str, Any],
     armature_obj: bpy.types.Object,
@@ -1210,10 +1246,15 @@ def bake_single_pose(
     target_frame: int,
     sample_index: int = 0,
     root_translation: str = "skip",
+    joint_name_filter: Collection[str] | None = None,
 ) -> int:
     """Insert one keyframe per joint at ``target_frame`` in the armature's
     active action, reading rotations from ``gltf``'s ``sample_index`` at
     ``source_frame``.
+
+    When ``joint_name_filter`` is not ``None``, only channels whose joint
+    name is in that collection are written; all other response joints are
+    skipped (existing keys at ``target_frame`` are left unchanged).
 
     On a Mixamo control rig the deform-bone keyframes alone don't show
     up — the Copy*/IK constraints make the deform bones follow the
@@ -1272,6 +1313,8 @@ def bake_single_pose(
         joint_name = nodes[node_idx].get("name", "")
         bone = pose.bones.get(joint_name)
         if bone is None:
+            continue
+        if joint_name_filter is not None and joint_name not in joint_name_filter:
             continue
 
         sampler = samplers[ch["sampler"]]

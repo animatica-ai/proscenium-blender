@@ -19,10 +19,11 @@ from __future__ import annotations
 import threading
 
 import bpy
-from bpy.props import BoolProperty, IntProperty, StringProperty
+from bpy.props import BoolProperty, EnumProperty, IntProperty, StringProperty
 from bpy.types import Operator
 
 from . import (
+    blender_compat,
     constraints_ui,
     gltf_to_blender,
     mmcp_client,
@@ -934,6 +935,25 @@ class PROSCENIUM_OT_generate_pose(Operator):
         ),
         default=False,
     )
+    pose_apply_scope: EnumProperty(
+        name="Apply pose to",
+        description="Which bones receive keyframes from the generated pose",
+        items=(
+            (
+                "ALL",
+                "All bones",
+                "Keyframe every joint in the server response",
+            ),
+            (
+                "SELECTED",
+                "Selected bones",
+                "Only keyframe bones that are selected on the target armature in "
+                "Pose mode (IK / control handles on a Mixamo rig expand to their "
+                "driving deform bones)",
+            ),
+        ),
+        default="ALL",
+    )
 
     # NOTE: keep these as plain class attributes (no type hints). Blender's
     # operator-registration walks ``__annotations__`` to resolve the class's
@@ -947,6 +967,7 @@ class PROSCENIUM_OT_generate_pose(Operator):
     _result = None
     _error = None
     _target_frame = 1
+    _pose_joint_filter = None
 
     @classmethod
     def poll(cls, context):
@@ -974,6 +995,7 @@ class PROSCENIUM_OT_generate_pose(Operator):
         layout.prop(self, "prompt")
         layout.prop(self, "seed")
         layout.prop(self, "preserve_height")
+        layout.prop(self, "pose_apply_scope")
         layout.label(text=f"Insert keyframe at frame {context.scene.frame_current}")
 
     # ----- entry -----------------------------------------------------------
@@ -1041,6 +1063,23 @@ class PROSCENIUM_OT_generate_pose(Operator):
         }
 
         self._target_frame = int(context.scene.frame_current)
+
+        self._pose_joint_filter = None
+        if self.pose_apply_scope == "SELECTED":
+            selected = {
+                pb.name for pb in arm.pose.bones if blender_compat.pose_bone_is_selected(pb)
+            }
+            if not selected:
+                self.report(
+                    {"ERROR"},
+                    'Pose scope is "Selected bones" but no bones are selected on '
+                    "the target armature — open Pose mode and select one or more bones",
+                )
+                return {"CANCELLED"}
+            self._pose_joint_filter = frozenset(
+                gltf_to_blender.resolve_pose_bake_joint_names(arm, selected)
+            )
+
         s.is_generating = True
         s.cancel_requested = False
         self._result = None
@@ -1110,11 +1149,21 @@ class PROSCENIUM_OT_generate_pose(Operator):
                 target_frame=self._target_frame,
                 sample_index=0,
                 root_translation="skip" if self.preserve_height else "height_only",
+                joint_name_filter=self._pose_joint_filter,
             )
         except Exception as exc:                         # noqa: BLE001
             self._cleanup(context)
             self.report({'ERROR'}, f"Bake failed: {exc}")
             return {'CANCELLED'}
+
+        if written == 0 and self._pose_joint_filter is not None:
+            self._cleanup(context)
+            self.report(
+                {"WARNING"},
+                "No pose channels matched the selected bones (names must match "
+                "skeleton joints in the response) — nothing keyframed",
+            )
+            return {"CANCELLED"}
 
         # Snap viewport to the freshly-keyframed pose.
         context.scene.frame_set(self._target_frame)

@@ -39,6 +39,8 @@ from __future__ import annotations
 import bpy
 from mathutils import Matrix, Vector
 
+from . import blender_compat
+
 
 # ---------------------------------------------------------------------------
 # Constants — pulled from the Mixamo addon's definitions/naming.py.
@@ -225,17 +227,7 @@ def _bake_control_bones(
     bones_data: list[tuple[int, dict[str, Matrix]]] = []
 
     def _is_selected(pb) -> bool:
-        # Blender 5.0 removed Bone.select; only PoseBone.select exists.
-        # Check the pose-bone form first, fall back to data-bone form.
-        try:
-            if hasattr(pb, "select"):
-                return bool(pb.select)
-        except Exception:
-            pass
-        try:
-            return bool(pb.bone.select)
-        except Exception:
-            return False
+        return blender_compat.pose_bone_is_selected(pb)
 
     def _get_bones_matrix() -> dict[str, Matrix]:
         m: dict[str, Matrix] = {}
@@ -680,14 +672,7 @@ def apply_anim_to_control_rig(
     # Direct deselect instead of ``bpy.ops.pose.select_all`` so we don't
     # need a 3D-View area in the context (modal/timer paths lack one).
     for pb in tar_arm.pose.bones:
-        try:
-            pb.bone.select = False
-        except Exception:
-            pass
-        try:
-            pb.select = False
-        except Exception:
-            pass
+        blender_compat.pose_bone_select_set(pb, False)
     bpy.context.view_layer.update()
 
     for src_name, tar_name in bones_map.items():
@@ -727,24 +712,10 @@ def apply_anim_to_control_rig(
             pole_pb = tar_arm.pose.bones.get(pole_name)
             if pole_pb is not None:
                 tar_arm.data.bones.active = pole_pb.bone
-                try:
-                    pole_pb.bone.select = True
-                except Exception:
-                    pass
-                try:
-                    pole_pb.select = True
-                except Exception:
-                    pass
+                blender_compat.pose_bone_select_set(pole_pb, True)
 
         tar_arm.data.bones.active = tar_pb.bone
-        try:
-            tar_pb.bone.select = True
-        except Exception:
-            pass
-        try:
-            tar_pb.select = True
-        except Exception:
-            pass
+        blender_compat.pose_bone_select_set(tar_pb, True)
 
     bpy.context.view_layer.update()
 
@@ -772,9 +743,6 @@ def apply_anim_to_control_rig(
         # No retarget constraint on poles, but they were left selected.
         pole_pb = tar_arm.pose.bones.get(C_PREFIX + pole_kind + side_suffix)
         if pole_pb is not None:
-            try:
-                pole_pb.bone.select = False
-            except Exception:
-                pass
+            blender_compat.pose_bone_select_set(pole_pb, False)
 
     return baked
