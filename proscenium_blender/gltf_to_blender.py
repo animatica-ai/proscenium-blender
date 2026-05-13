@@ -1171,6 +1171,33 @@ def _tag_keyframe_types(action: bpy.types.Action, anchor_frames: set[int]) -> No
                     _tag(cb.fcurves)
 
 
+def _tag_keys_at_frame_as_authored(action: bpy.types.Action, frame: int) -> None:
+    """Set every keyframe at ``frame`` on ``action`` to type ``'KEYFRAME'``.
+
+    Pose generation authors a deliberate pose at a single frame; this
+    overrides any ``'GENERATED'`` tag inherited from a motion-bake preview
+    so the dopesheet shows the pose as a regular (yellow) keyframe.
+    """
+    target = int(round(frame))
+
+    def _tag(fcurves):
+        for fc in fcurves:
+            for kp in fc.keyframe_points:
+                if int(round(kp.co[0])) == target:
+                    kp.type = 'KEYFRAME'
+
+    flat = getattr(action, "fcurves", None)
+    if flat is not None:
+        _tag(flat)
+        return
+    for layer in getattr(action, "layers", ()):
+        for strip in getattr(layer, "strips", ()):
+            for slot in getattr(action, "slots", ()):
+                cb = strip.channelbag(slot, ensure=False) if hasattr(strip, "channelbag") else None
+                if cb is not None:
+                    _tag(cb.fcurves)
+
+
 # ---------------------------------------------------------------------------
 # Single-pose insertion (pose generator path — additive, non-destructive)
 # ---------------------------------------------------------------------------
@@ -1296,6 +1323,15 @@ def bake_single_pose(
                 frame_start=int(target_frame),
                 frame_end=int(target_frame),
             )
+
+        # Tag every key at the pose-gen frame as authored. ``keyframe_insert``
+        # preserves the existing type when overwriting, so without this the
+        # new pose would inherit ``'GENERATED'`` from an underlying motion-bake
+        # preview sample at the same frame. Run after the optional control-rig
+        # bake so its writes are tagged too.
+        _tag_keys_at_frame_as_authored(
+            armature_obj.animation_data.action, int(target_frame)
+        )
 
     return written
 

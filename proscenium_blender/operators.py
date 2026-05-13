@@ -430,13 +430,28 @@ class PROSCENIUM_OT_generate(Operator):
             self.report({'ERROR'}, "Connect to the server first (Connection panel → Connect)")
             return {'CANCELLED'}
 
-        # Regenerate path: revert to the source action so the request reflects
-        # the user's authored keyframes, not the generated preview.
+        # Regenerate path: fold preview-time edits back onto the source
+        # action, then assign source as the active action. Without the
+        # strip+merge step, the request would be built from the untouched
+        # pre-generation source and any keys the user added during preview
+        # would be lost (they live on the preview action, not on source).
         if settings.source_action_name:
             src = bpy.data.actions.get(settings.source_action_name)
             if src is not None:
                 if arm.animation_data is None:
                     arm.animation_data_create()
+                preview = (
+                    arm.animation_data.action
+                    if arm.animation_data and arm.animation_data.action
+                    else None
+                )
+                if (
+                    preview is not None
+                    and preview is not src
+                    and preview.name.startswith(request_builder._GENERATED_ACTION_PREFIXES)
+                ):
+                    constraints_ui.strip_generated_keyframe_points(preview)
+                    constraints_ui.merge_preview_keyframes_into_source(src, preview)
                 arm.animation_data.action = src
 
         try:
