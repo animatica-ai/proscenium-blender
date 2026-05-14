@@ -153,6 +153,13 @@ def load_body_mesh(
     mod.use_vertex_groups = True
     mod.use_bone_envelopes = False
 
+    # Viewport polish: smooth body shading; draw bones in front of the mesh
+    # so the rig stays readable through the SOMA surface.
+    for poly in me.polygons:
+        poly.use_smooth = True
+    me.update()
+    arm_obj.show_in_front = True
+
     # Tag for traceability — the panel can detect "this armature already
     # has a body" and skip re-import.
     body["proscenium_body_for"] = arm_obj.name
