@@ -32,6 +32,12 @@ class PROSCENIUM_PT_main(ProsceniumPanelBase, Panel):
         layout = self.layout
         settings = context.scene.proscenium
 
+        layout.operator(
+            "proscenium.open_discord_help",
+            icon='URL',
+            text="Need help?",
+        )
+
         # Safety net: if the picker still holds a dangling armature (e.g.
         # the user just deleted it as part of a multi-object delete that
         # bypassed Blender's auto-remap), schedule a one-shot cleanup. The

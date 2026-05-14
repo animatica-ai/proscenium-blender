@@ -1301,6 +1301,19 @@ class PROSCENIUM_OT_open_upgrade(Operator):
         return {'FINISHED'}
 
 
+DISCORD_HELP_URL = "https://discord.gg/A8CrURBewz"
+
+
+class PROSCENIUM_OT_open_discord_help(Operator):
+    bl_idname = "proscenium.open_discord_help"
+    bl_label = "Need help?"
+    bl_description = "Open the Animatica Discord — questions, feedback, and help from the team"
+
+    def execute(self, context):
+        bpy.ops.wm.url_open(url=DISCORD_HELP_URL)
+        return {'FINISHED'}
+
+
 class PROSCENIUM_OT_dismiss_quota(Operator):
     bl_idname = "proscenium.dismiss_quota"
     bl_label = "Dismiss"
@@ -1325,6 +1338,7 @@ _classes = (
     PROSCENIUM_OT_signin,
     PROSCENIUM_OT_signout,
     PROSCENIUM_OT_open_upgrade,
+    PROSCENIUM_OT_open_discord_help,
     PROSCENIUM_OT_dismiss_quota,
 )
 
