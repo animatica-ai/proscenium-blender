@@ -4,6 +4,56 @@ All notable changes to the Proscenium for Blender addon are documented here.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.2] — 2026-05-14
+
+### Added
+
+- **Generate Pose: apply to all bones or selected bones.** New *Apply pose
+  to* option on the dialog (*All bones* / *Selected bones*). Selected
+  scope uses pose-bone selection; on Mixamo-style control rigs, IK /
+  control handles expand to the driving deform joints. Scripting:
+  `pose_apply_scope='SELECTED'` on `proscenium.generate_pose`.
+- **`blender_compat` helpers** for pose-bone selection across Blender
+  versions (`PoseBone.select` on Blender 5 vs. legacy `Bone.select`).
+- **Need help?** Button at the top of the Proscenium sidebar opens the
+  [Animatica Discord](https://discord.gg/A8CrURBewz) in your browser
+  (`proscenium.open_discord_help`).
+
+### Changed
+
+- **Canonical import with SOMA77 body.** The reference body mesh is
+  shaded smooth, the armature uses **In Front** in the viewport so bones
+  read through the surface, and after a successful body import the view
+  switches to **Pose** mode on the new rig (best-effort; ignored without a
+  3D View context).
+
+### Fixed
+
+- **Target armature after delete.** Deleting the rig (including multi-object
+  delete) clears the picker, preview / source-action bookkeeping, timeline
+  prompt strips, and dangling pointers. Centralized
+  `reset_target_armature_state`; depsgraph validation treats unlinked
+  armatures as gone (`users_collection`); panel and timer fallbacks when
+  RNA updates do not fire.
+- **Generate / Regenerate after a deleted rig.** Stale preview flags no
+  longer send merges onto the wrong action when you pick a new character.
+- **Timeline strip delete.** Deletes the strip under the cursor when
+  possible, persists removals onto the target armature’s stored blocks, and
+  clears strips when there is no live target armature.
+- **Regenerate (Generate again) with a stashed source action.** Before
+  building the motion request, generated sample keys are stripped from the
+  preview action and surviving keys are merged onto the source action, then
+  the source is made active again — keys added or edited during preview are
+  no longer dropped when you click **Generate** a second time.
+- **Reject after motion preview.** Same strip-and-merge path: removes
+  generated motion samples from the preview while preserving authored
+  keyframes, merges them onto the saved source action when present, and
+  restores that action (avoids T-pose gaps on channels that only had
+  generated keys).
+- **Generate Pose keyframe tags.** Keys written at the pose frame are tagged
+  as authored so the Dopesheet does not treat them like inherited
+  **GENERATED** tags from a motion-bake preview.
+
 ## [0.3.1] — 2026-05-08
 
 ### Added
@@ -121,6 +171,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release.
 
+[0.3.2]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.3.2
 [0.3.1]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.3.1
 [0.3.0]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.3.0
 [0.2.0]: https://github.com/animatica-ai/proscenium-blender/releases/tag/v0.2.0
