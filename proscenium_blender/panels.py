@@ -11,7 +11,7 @@ Server URL + auth live in Edit > Preferences > Add-ons > Proscenium.
 import bpy
 from bpy.types import Panel
 
-from . import constraints_ui, mmcp_client
+from . import constraints_ui, mmcp_client, properties
 
 
 class ProsceniumPanelBase:
@@ -31,6 +31,19 @@ class PROSCENIUM_PT_main(ProsceniumPanelBase, Panel):
     def draw(self, context):
         layout = self.layout
         settings = context.scene.proscenium
+
+        # Safety net: if the picker still holds a dangling armature (e.g.
+        # the user just deleted it as part of a multi-object delete that
+        # bypassed Blender's auto-remap), schedule a one-shot cleanup. The
+        # actual reset cannot run from a draw callback, so we defer to a
+        # timer and continue rendering this frame — the panel will redraw
+        # with the cleared state on the next tick.
+        try:
+            target = settings.target_armature
+        except ReferenceError:
+            target = object()  # treat as dangling
+        if target is not None and not properties._is_live_armature(target):
+            properties.schedule_target_reset(context.scene.name)
 
         # Quota banner. Sticks around after a 429 from the cloud until the
         # user upgrades, dismisses, or makes a successful generation. Shown
@@ -107,10 +120,17 @@ class PROSCENIUM_PT_main(ProsceniumPanelBase, Panel):
             # empty for free-form generations (no prior action to restore
             # to), so gating on it would hide the Push to NLA / Reject
             # buttons after a successful free-form bake.
-            in_preview = bool(getattr(settings, "is_previewing", False)) or bool(settings.source_action_name)
+            arm_live = properties._live_armature(settings.target_armature)
+            in_preview = (
+                arm_live is not None
+                and (
+                    bool(getattr(settings, "is_previewing", False))
+                    or bool(settings.source_action_name)
+                )
+            )
 
             col = layout.column(align=True)
-            col.enabled = settings.target_armature is not None
+            col.enabled = arm_live is not None
 
             gen_text = "Regenerate Motion" if in_preview else "Generate Motion"
             row = col.row()

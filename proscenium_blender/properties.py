@@ -3,6 +3,7 @@
 import json
 
 import bpy
+from bpy.app.handlers import persistent
 from bpy.props import (
     BoolProperty,
     CollectionProperty,
@@ -111,14 +112,144 @@ def _preview_path_snap_update(self, context):
         path_follow.sync_path_to_armature(arm, context.scene, curve)
 
 
-def _target_armature_update(self, context):
-    """When the user switches target armature, swap the blocks list to match
-    that armature's saved state (or seed defaults)."""
-    settings = context.scene.proscenium
-    new_arm = settings.target_armature
-    old_arm = settings.previous_target_armature
+# ---------------------------------------------------------------------------
+# Target armature lifecycle
+# ---------------------------------------------------------------------------
 
-    if new_arm == old_arm:
+def _is_live_armature(obj) -> bool:
+    """``True`` iff ``obj`` is an armature linked into the scene tree.
+
+    Three failure modes to catch:
+
+    1. **Dangling wrapper** — any RNA access raises ``ReferenceError``
+       (``getattr`` does not catch it).
+    2. **Not in ``bpy.data``** — the ID was fully removed but Blender did
+       not auto-clear the ``PointerProperty``.
+    3. **Orphan datablock** — the object is still in ``bpy.data`` but
+       every collection has dropped it. A multi-object delete leaves the
+       deleted rig in this state until Blender's garbage pass purges it;
+       the single-object delete path either purges immediately or fires
+       the RNA update callback, which is why this code never tripped
+       before.
+    """
+    if obj is None:
+        return False
+    try:
+        if obj.type != 'ARMATURE':
+            return False
+        name = obj.name
+        if bpy.data.objects.get(name) is not obj:
+            return False
+        return bool(obj.users_collection)
+    except (ReferenceError, AttributeError):
+        return False
+
+
+def _live_armature(obj):
+    """Return ``obj`` if it is a live armature, else ``None``."""
+    return obj if _is_live_armature(obj) else None
+
+
+def _redraw_proscenium_editors() -> None:
+    """Tag every editor so the picker and timeline reflect the new state.
+
+    Tagging only ``VIEW_3D`` / ``DOPESHEET_EDITOR`` is enough in theory, but
+    the sidebar panel can sit in a region that does not redraw until a
+    broader tag, and properties-editor mirrors can hold the stale name
+    in their cached UI. Tag everything — it is cheap.
+    """
+    wm = bpy.context.window_manager
+    if wm is None:
+        return
+    for win in wm.windows:
+        for area in win.screen.areas:
+            area.tag_redraw()
+
+
+_pending_reset_scene_names: set[str] = set()
+
+
+def schedule_target_reset(scene_name: str) -> None:
+    """Queue a one-shot timer to reset stale target state on ``scene_name``.
+
+    Draw callbacks (panels, gpu overlays) must never mutate scene
+    properties directly. When such a callback notices that
+    ``target_armature`` is dangling but the depsgraph handler has not
+    fired yet, it calls this to defer the cleanup to the next app tick.
+    """
+    if not scene_name or scene_name in _pending_reset_scene_names:
+        return
+    _pending_reset_scene_names.add(scene_name)
+
+    def _flush():
+        try:
+            sc = bpy.data.scenes.get(scene_name)
+            if sc is None:
+                return None
+            settings = getattr(sc, "proscenium", None)
+            if settings is None:
+                return None
+            if _scene_needs_target_reset(settings):
+                reset_target_armature_state(settings)
+        finally:
+            _pending_reset_scene_names.discard(scene_name)
+        return None
+
+    bpy.app.timers.register(_flush, first_interval=0.0)
+
+
+_in_target_reset = False
+
+
+def reset_target_armature_state(settings) -> None:
+    """Wipe every piece of scene state bound to the target armature.
+
+    Called when the rig was deleted, when the user clears the picker, or when
+    the file loads with no target set. Idempotent and re-entrancy-safe: the
+    ``settings.target_armature = None`` assignment fires the update callback,
+    which re-enters this helper; the ``_in_target_reset`` flag makes the
+    nested call a no-op.
+    """
+    global _in_target_reset
+    if _in_target_reset:
+        return
+    _in_target_reset = True
+    try:
+        if settings.target_armature is not None:
+            settings.target_armature = None
+        if settings.previous_target_armature is not None:
+            settings.previous_target_armature = None
+        settings.is_previewing = False
+        settings.source_action_name = ""
+        settings.prompt_blocks.clear()
+        settings.active_block_index = 0
+    finally:
+        _in_target_reset = False
+    _redraw_proscenium_editors()
+
+
+def _target_armature_update(self, context):
+    """Sync per-armature state when the picker changes.
+
+    Three cases:
+      * picker cleared (or rig deleted, since Blender auto-clears the
+        pointer) → wipe scene state via ``reset_target_armature_state``;
+      * picker switched to a different rig → persist the previous rig's
+        prompt blocks, then load the new rig's;
+      * idempotent re-assignment (same id) → no-op.
+    """
+    if _in_target_reset:
+        return
+
+    settings = context.scene.proscenium
+    new_arm = _live_armature(settings.target_armature)
+    old_arm = _live_armature(settings.previous_target_armature)
+
+    if new_arm is None:
+        reset_target_armature_state(settings)
+        return
+
+    if new_arm is old_arm:
         return
 
     if old_arm is not None:
@@ -127,17 +258,14 @@ def _target_armature_update(self, context):
         except ReferenceError:
             pass
 
-    settings.prompt_blocks.clear()
-    if new_arm is not None:
-        load_blocks_from_armature(new_arm, settings)
+    # Preview / Accept-Reject bookkeeping is tied to the rig that was baked,
+    # so switching rigs always invalidates it.
+    settings.is_previewing = False
+    settings.source_action_name = ""
 
+    load_blocks_from_armature(new_arm, settings)
     settings.previous_target_armature = new_arm
-
-    # Redraw dopesheet so the strip overlay updates
-    for win in bpy.context.window_manager.windows:
-        for area in win.screen.areas:
-            if area.type == "DOPESHEET_EDITOR":
-                area.tag_redraw()
+    _redraw_proscenium_editors()
 
 
 def _inplace_update(self, context):
@@ -520,6 +648,61 @@ class ProsceniumSettings(PropertyGroup):
 
 
 # ---------------------------------------------------------------------------
+# Depsgraph — catch armature deletions that bypass the RNA update callback
+# ---------------------------------------------------------------------------
+
+def _purge_stale_depsgraph_handlers(handler_list, fn_name: str) -> None:
+    for h in list(handler_list):
+        if getattr(h, "__name__", None) == fn_name:
+            handler_list.remove(h)
+
+
+def _scene_needs_target_reset(s) -> bool:
+    """True if scene state is inconsistent with a live target armature.
+
+    Triggers cleanup when:
+      * ``target_armature`` is a dangling wrapper (single-object delete on
+        rigs that did not survive Blender's auto-remap);
+      * ``target_armature`` is ``None`` but per-target state lingers — the
+        case that breaks multi-object delete, where Blender silently
+        clears the pointer to ``None`` without firing the RNA update
+        callback, leaving ``previous_target_armature`` / ``prompt_blocks``
+        / preview flags untouched.
+    """
+    try:
+        target = s.target_armature
+    except ReferenceError:
+        return True
+    if target is not None:
+        return not _is_live_armature(target)
+
+    try:
+        if s.previous_target_armature is not None:
+            return True
+    except ReferenceError:
+        return True
+    if len(s.prompt_blocks) > 0:
+        return True
+    if s.is_previewing or s.source_action_name:
+        return True
+    return False
+
+
+@persistent
+def _validate_target_armature_on_depsgraph(_scene, _depsgraph) -> None:
+    """Drop dangling ``target_armature`` pointers and any per-target state
+    that survives them. Runs on every depsgraph tick; the actual reset
+    is idempotent so the cost when nothing changed is a few attribute
+    reads per scene."""
+    for scene in bpy.data.scenes:
+        s = getattr(scene, "proscenium", None)
+        if s is None:
+            continue
+        if _scene_needs_target_reset(s):
+            reset_target_armature_state(s)
+
+
+# ---------------------------------------------------------------------------
 # Registration
 # ---------------------------------------------------------------------------
 
@@ -529,14 +712,25 @@ _classes = (
     ProsceniumSettings,
 )
 
+_DEPSGRAPH_HANDLER_NAME = "_validate_target_armature_on_depsgraph"
+
 
 def register():
     for cls in _classes:
         bpy.utils.register_class(cls)
     bpy.types.Scene.proscenium = PointerProperty(type=ProsceniumSettings)
+    _purge_stale_depsgraph_handlers(
+        bpy.app.handlers.depsgraph_update_post, _DEPSGRAPH_HANDLER_NAME,
+    )
+    bpy.app.handlers.depsgraph_update_post.append(
+        _validate_target_armature_on_depsgraph,
+    )
 
 
 def unregister():
+    _purge_stale_depsgraph_handlers(
+        bpy.app.handlers.depsgraph_update_post, _DEPSGRAPH_HANDLER_NAME,
+    )
     del bpy.types.Scene.proscenium
     for cls in reversed(_classes):
         bpy.utils.unregister_class(cls)

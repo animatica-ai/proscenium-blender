@@ -82,6 +82,15 @@ _draw_handle = None
 # Strip height accessors (for drag-resize from timeline_operators)
 # ---------------------------------------------------------------------------
 
+def _schedule_target_reset(scene) -> None:
+    """Defer target-state cleanup to the next app tick via the shared
+    ``properties.schedule_target_reset`` (mutating scene props from a draw
+    callback is forbidden)."""
+    from . import properties
+
+    properties.schedule_target_reset(getattr(scene, "name", None) or "")
+
+
 def get_strip_height():
     """Return the current strip lane height (pixels)."""
     return _strip_height
@@ -295,6 +304,17 @@ def draw_timeline_strips():
         return
 
     props = scene.proscenium
+    from . import properties
+
+    # Safety net: if the target rig vanished but the depsgraph handler has
+    # not run yet, defer the cleanup to a one-shot timer (mutating scene
+    # data from a draw callback is unsafe) and skip rendering this frame.
+    if properties._live_armature(props.target_armature) is None:
+        if len(props.prompt_blocks) > 0 or props.target_armature is not None:
+            inline_edit_state["active"] = False
+            inline_edit_state["index"] = -1
+            _schedule_target_reset(scene)
+        return
     if len(props.prompt_blocks) == 0:
         return
 

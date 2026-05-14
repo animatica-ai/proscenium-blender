@@ -58,13 +58,15 @@ def _proscenium_save_pre(dummy):
 @persistent
 def _proscenium_load_post(dummy):
     """After loading a .blend, hydrate settings.prompt_blocks from the
-    target armature's custom properties (or seed defaults)."""
+    target armature's custom properties (or wipe state if the saved target
+    no longer points at a live armature)."""
     for scene in bpy.data.scenes:
         settings = getattr(scene, "proscenium", None)
         if settings is None:
             continue
-        arm = settings.target_armature
+        arm = properties._live_armature(settings.target_armature)
         if arm is None:
+            properties.reset_target_armature_state(settings)
             continue
         try:
             properties.load_blocks_from_armature(arm, settings)

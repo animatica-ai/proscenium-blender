@@ -27,8 +27,25 @@ from . import (
     constraints_ui,
     gltf_to_blender,
     mmcp_client,
+    properties,
     request_builder,
 )
+
+
+def _live_target_armature_or_clear(settings):
+    """Return the scene's target armature if it still exists; else ``None``.
+
+    When the pointer is dangling (rig deleted), routes through
+    :func:`properties.reset_target_armature_state` so every piece of scene
+    state tied to the rig — picker, prompt blocks, preview flags — is
+    wiped in one pass.
+    """
+    arm = properties._live_armature(settings.target_armature)
+    if arm is not None:
+        return arm
+    if settings.target_armature is not None:
+        properties.reset_target_armature_state(settings)
+    return None
 
 
 MOTION_ACTION_PREFIX = "Proscenium_Motion"
@@ -421,9 +438,12 @@ class PROSCENIUM_OT_generate(Operator):
             self.report({'WARNING'}, "Already generating — wait or click Cancel")
             return {'CANCELLED'}
 
-        arm = settings.target_armature
-        if arm is None or arm.type != 'ARMATURE':
-            self.report({'ERROR'}, "Set a target armature first")
+        arm = _live_target_armature_or_clear(settings)
+        if arm is None:
+            self.report(
+                {'ERROR'},
+                "Set a target armature first (or the previous rig was deleted)",
+            )
             return {'CANCELLED'}
 
         model_caps = mmcp_client.cached_model(settings.model_id)
@@ -578,6 +598,15 @@ class PROSCENIUM_OT_generate(Operator):
         # Successful run — clear any stale quota banner.
         _clear_quota_state(context.scene.proscenium)
 
+        arm = _live_target_armature_or_clear(settings)
+        if arm is None:
+            self._cleanup(context)
+            self.report(
+                {'ERROR'},
+                "Target armature is missing or was deleted before the bake finished",
+            )
+            return {'CANCELLED'}
+
         # Bake. Two paths:
         #   • 2+ enabled prompt blocks → split the response into one action
         #     per block, push to NLA. Lets the user iterate on individual
@@ -591,12 +620,12 @@ class PROSCENIUM_OT_generate(Operator):
         # Recompute gen_end via the same helper to stay in sync with what
         # was sent to the server.
         _, gen_end = request_builder.compute_frame_range(
-            settings.prompt_blocks, settings.target_armature, context.scene
+            settings.prompt_blocks, arm, context.scene
         )
 
         block_ranges = (
             _block_ranges_for_split(settings.prompt_blocks, gen_start, gen_end)
-            if not request_builder.is_control_rig(settings.target_armature)
+            if not request_builder.is_control_rig(arm)
             else []
         )
 
@@ -615,7 +644,7 @@ class PROSCENIUM_OT_generate(Operator):
             )
             action = gltf_to_blender.bake_gltf_to_armature(
                 self._result,
-                settings.target_armature,
+                arm,
                 sample_index=0,
                 action_name=preview_name,
                 start_frame=gen_start,
@@ -631,13 +660,12 @@ class PROSCENIUM_OT_generate(Operator):
             # this branch is just for the "toggle was already on when the
             # bake completed" case.
             if getattr(settings, "inplace", False):
-                _apply_inplace_constraint(settings.target_armature, enabled=True)
+                _apply_inplace_constraint(arm, enabled=True)
             else:
                 # Defensive: if a stale constraint lingers from a prior
                 # session, clear it.
-                _apply_inplace_constraint(settings.target_armature, enabled=False)
+                _apply_inplace_constraint(arm, enabled=False)
 
-            arm = settings.target_armature
             if block_ranges:
                 # Stash split metadata for Accept. Blender's ID-property
                 # arrays are homogeneous numerics-only ("only floats, ints,
@@ -735,10 +763,10 @@ class PROSCENIUM_OT_accept(Operator):
 
     def execute(self, context):
         s = context.scene.proscenium
-        arm = s.target_armature
+        arm = _live_target_armature_or_clear(s)
         n_pushed = 0
 
-        if arm is not None and arm.type == 'ARMATURE':
+        if arm is not None:
             import json as _json
             pending_raw = arm.get("proscenium_pending_block_ranges")
             try:
@@ -826,9 +854,12 @@ class PROSCENIUM_OT_reject(Operator):
 
     def execute(self, context):
         s   = context.scene.proscenium
-        arm = s.target_armature
-        if arm is None or arm.type != 'ARMATURE':
-            self.report({'ERROR'}, "Target armature is gone")
+        arm = _live_target_armature_or_clear(s)
+        if arm is None:
+            self.report(
+                {'ERROR'},
+                "Target armature is missing or was deleted — choose an armature again",
+            )
             return {'CANCELLED'}
 
         if arm.animation_data is None:
@@ -1005,9 +1036,12 @@ class PROSCENIUM_OT_generate_pose(Operator):
             self.report({'WARNING'}, "Already generating — wait or click Cancel")
             return {'CANCELLED'}
 
-        arm = s.target_armature
-        if arm is None or arm.type != 'ARMATURE':
-            self.report({'ERROR'}, "Set a target armature first")
+        arm = _live_target_armature_or_clear(s)
+        if arm is None:
+            self.report(
+                {'ERROR'},
+                "Set a target armature first (or the previous rig was deleted)",
+            )
             return {'CANCELLED'}
 
         model_caps = mmcp_client.cached_model(s.model_id)
@@ -1133,6 +1167,15 @@ class PROSCENIUM_OT_generate_pose(Operator):
         # Successful run — clear any stale quota banner.
         _clear_quota_state(context.scene.proscenium)
 
+        arm = _live_target_armature_or_clear(s)
+        if arm is None:
+            self._cleanup(context)
+            self.report(
+                {'ERROR'},
+                "Target armature is missing or was deleted before the pose bake finished",
+            )
+            return {'CANCELLED'}
+
         n_frames = gltf_to_blender.sample_frame_count(self._result, sample_index=0)
         if n_frames < 1:
             self._cleanup(context)
@@ -1144,7 +1187,7 @@ class PROSCENIUM_OT_generate_pose(Operator):
         try:
             written = gltf_to_blender.bake_single_pose(
                 self._result,
-                s.target_armature,
+                arm,
                 source_frame=0,
                 target_frame=self._target_frame,
                 sample_index=0,

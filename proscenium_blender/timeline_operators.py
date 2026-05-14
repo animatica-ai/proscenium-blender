@@ -508,10 +508,12 @@ class PROSCENIUM_OT_add_strip_between_keyframes(bpy.types.Operator):
 # ---------------------------------------------------------------------------
 
 class PROSCENIUM_OT_timeline_strip_delete(bpy.types.Operator):
-    """Delete the active Proscenium strip (Backspace/Delete).
+    """Delete a Proscenium strip (Backspace/Delete).
 
-    Only activates when the mouse cursor is inside the strip lane area.
-    Otherwise passes through so Blender can handle keyframe deletion.
+    Prefers the strip under the cursor; otherwise removes the active strip when
+    the cursor is in the Proscenium lane. Writes back to the target armature so
+    deleted strips do not reappear after switching rigs. Passes through outside
+    the lane so Blender can handle keyframe deletion.
     """
 
     bl_idname = "proscenium.timeline_strip_delete"
@@ -531,7 +533,10 @@ class PROSCENIUM_OT_timeline_strip_delete(bpy.types.Operator):
             return {"PASS_THROUGH"}
 
         props = context.scene.proscenium
-        idx = props.active_block_index
+        hit = hit_test_strips(context, event.mouse_region_x, event.mouse_region_y)
+        idx = hit["index"]
+        if idx is None:
+            idx = props.active_block_index
 
         if not (0 <= idx < len(props.prompt_blocks)):
             return {"PASS_THROUGH"}
@@ -545,6 +550,10 @@ class PROSCENIUM_OT_timeline_strip_delete(bpy.types.Operator):
             props.active_block_index = 0
         elif props.active_block_index >= len(props.prompt_blocks):
             props.active_block_index = len(props.prompt_blocks) - 1
+
+        from .properties import save_blocks_to_armature
+
+        save_blocks_to_armature(props.target_armature, props)
 
         context.area.tag_redraw()
         return {"FINISHED"}
