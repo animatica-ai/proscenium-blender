@@ -115,6 +115,13 @@ class PROSCENIUM_OT_import_canonical_skeleton(bpy.types.Operator):
         msg = f"Imported {model_id} ({len(joints)} joints)"
         if body_loaded:
             msg += " with body mesh"
+            try:
+                context.view_layer.objects.active = arm_obj
+                bpy.ops.object.mode_set(mode='POSE')
+            except Exception:
+                # No 3D View context (e.g. headless / script) — armature import
+                # still succeeded.
+                pass
         self.report({'INFO'}, msg)
         return {'FINISHED'}
 
